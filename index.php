@@ -1,0 +1,549 @@
+<?php
+declare(strict_types=1);
+$configFile = __DIR__ . '/config.php';
+if (!is_file($configFile)) {
+    http_response_code(503);
+    echo '<h1>Cycle Exam Portal is not configured</h1><p>Copy <code>config.example.php</code> to <code>config.php</code>, edit the database settings, then import <code>install.sql</code> in phpMyAdmin.</p>';
+    exit;
+}
+$config = require $configFile;
+date_default_timezone_set($config['timezone'] ?? 'Asia/Kolkata');
+$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off');
+session_name('cycle_exam_session');
+session_set_cookie_params([
+    'lifetime' => 0, 'path' => '/',
+    'secure' => $isHttps, 'httponly' => true, 'samesite' => 'Lax'
+]);
+session_start();
+if (!empty($_SESSION['last_activity']) && time() - (int)$_SESSION['last_activity'] > ((int)($config['session_timeout_minutes'] ?? 45) * 60)) {
+    $_SESSION = [];
+    session_destroy();
+    session_start();
+    $_SESSION['flash'] = ['type'=>'warning','message'=>'Your session expired. Please sign in again.'];
+}
+$_SESSION['last_activity'] = time();
+
+try {
+    $pdo = new PDO(
+        'mysql:host='.$config['db_host'].';dbname='.$config['db_name'].';charset=utf8mb4',
+        $config['db_user'], $config['db_pass'],
+        [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC, PDO::ATTR_EMULATE_PREPARES=>false]
+    );
+} catch (Throwable $e) {
+    http_response_code(500);
+    error_log('Cycle Exam DB connection error: '.$e->getMessage());
+    echo '<h1>Database connection failed</h1><p>Check config.php, confirm MySQL is running, and import install.sql.</p>';
+    exit;
+}
+
+try {
+    $hasFlagColumn = static function () use ($pdo): bool {
+        $s=$pdo->prepare("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='attempt_answers' AND COLUMN_NAME='is_flagged'");
+        $s->execute();
+        return (int)$s->fetchColumn() > 0;
+    };
+    if (!$hasFlagColumn()) {
+        try {
+            $pdo->exec('ALTER TABLE attempt_answers ADD is_flagged TINYINT(1) NOT NULL DEFAULT 0');
+        } catch (Throwable $migrationError) {
+            if (!$hasFlagColumn()) throw $migrationError;
+        }
+    }
+} catch (Throwable $e) {
+    http_response_code(503);
+    error_log('Cycle Exam schema migration error (attempt_answers.is_flagged): '.$e->getMessage());
+    echo '<h1>Database update required</h1><p>The exam database is missing a required column, and automatic setup could not apply the update. Ask your administrator to run this SQL in phpMyAdmin:</p><pre>ALTER TABLE attempt_answers ADD is_flagged TINYINT(1) NOT NULL DEFAULT 0;</pre><p>Then reload the page. No exam answers were deleted.</p>';
+    exit;
+}
+
+function e(mixed $v): string { return htmlspecialchars((string)$v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
+function csrf_token(): string { if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(32)); return $_SESSION['csrf']; }
+function verify_csrf(): void {
+    $sent = (string)($_POST['csrf'] ?? '');
+    if (!$sent || !hash_equals((string)($_SESSION['csrf'] ?? ''), $sent)) { http_response_code(419); exit('Security token expired. Refresh and try again.'); }
+}
+function current_user(): ?array { return $_SESSION['user'] ?? null; }
+function require_login(): void { if (!current_user()) { header('Location: index.php?action=login'); exit; } }
+function require_role(array $roles): void { require_login(); if (!in_array(current_user()['role'] ?? '', $roles, true)) { http_response_code(403); exit('Access denied.'); } }
+function flash(string $type, string $message): void { $_SESSION['flash'] = compact('type','message'); }
+function redirect(string $action): never { header('Location: index.php?action='.rawurlencode($action)); exit; }
+function audit(PDO $pdo, string $action, string $targetType='', ?string $targetId=null, array $meta=[]): void {
+    try {
+        $s=$pdo->prepare('INSERT INTO audit_logs(actor_user_id,action,target_type,target_id,metadata,ip_address,created_at) VALUES(?,?,?,?,?,?,NOW())');
+        $s->execute([current_user()['id'] ?? null,$action,$targetType,$targetId,json_encode($meta, JSON_UNESCAPED_SLASHES),substr((string)($_SERVER['REMOTE_ADDR']??''),0,45)]);
+    } catch (Throwable $ignored) {}
+}
+function setting(PDO $pdo, string $key, string $default=''): string {
+    try { $s=$pdo->prepare('SELECT setting_value FROM settings WHERE setting_key=?'); $s->execute([$key]); $v=$s->fetchColumn(); return $v === false ? $default : (string)$v; }
+    catch(Throwable $e) { return $default; }
+}
+function h(string $s): string { return e($s); }
+function student_exam_access(array $exam, ?array $attempt): array {
+    if ($attempt && $attempt['status'] === 'cancelled') return ['label'=>'Attempt cancelled','action'=>null];
+    if ($attempt && $attempt['status'] !== 'in_progress') return ['label'=>'Submitted','action'=>null];
+    if ($attempt) {
+        $deadline=min(strtotime($attempt['started_at'])+(int)$exam['duration_minutes']*60,strtotime($exam['end_at']));
+        if ($exam['status'] !== 'active' || time() >= $deadline) return ['label'=>'Attempt saved · resume to submit','action'=>'Resume / submit'];
+        return ['label'=>'In progress','action'=>'Resume exam'];
+    }
+    if ($exam['status'] !== 'active') return ['label'=>ucfirst((string)$exam['status']),'action'=>null];
+    if (time() < strtotime($exam['start_at'])) return ['label'=>'Opens '.date('d M, H:i',strtotime($exam['start_at'])),'action'=>null];
+    if (time() > strtotime($exam['end_at'])) return ['label'=>'Exam window ended','action'=>null];
+    return ['label'=>'Available now','action'=>'Take exam'];
+}
+
+$action = (string)($_GET['action'] ?? (current_user() ? 'dashboard' : 'login'));
+$publicActions = ['login','logout','public_policies'];
+if (!in_array($action, $publicActions, true)) require_login();
+if (current_user() && !empty(current_user()['must_change_password']) && !in_array($action, ['change_password','logout'], true)) redirect('change_password');
+if (current_user() && current_user()['role']==='teacher' && !in_array($action,['subjects','questions','profile','change_password','logout'],true)) redirect('subjects');
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') verify_csrf();
+
+if ($action === 'logout') {
+    $_SESSION = [];
+    if (ini_get('session.use_cookies')) { $p=session_get_cookie_params(); setcookie(session_name(), '', time()-42000, $p['path'], '', $p['secure'], $p['httponly']); }
+    session_destroy();
+    header('Location: index.php?action=login'); exit;
+}
+
+if ($action === 'student_template') {
+    require_role(['super_admin','exam_admin']);
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="student_import_template.csv"');
+    $out=fopen('php://output','w');
+    fputcsv($out,['register_number','student_name','department','year_level','section']);
+    fputcsv($out,['REG2026001','Example Student','Computer Science','1','A']);
+    fclose($out); exit;
+}
+
+if ($action === 'login' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $identifier = trim((string)($_POST['identifier'] ?? ''));
+    $password = (string)($_POST['password'] ?? '');
+    $ip = substr((string)($_SERVER['REMOTE_ADDR'] ?? ''),0,45);
+    $count = 0;
+    try { $q=$pdo->prepare("SELECT COUNT(*) FROM login_attempts WHERE ip_address=? AND attempted_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE) AND succeeded=0"); $q->execute([$ip]); $count=(int)$q->fetchColumn(); } catch(Throwable $e) {}
+    if ($count >= 12) { flash('danger','Too many login attempts. Please wait 15 minutes.'); redirect('login'); }
+    $s=$pdo->prepare('SELECT id,login_id,display_name,password_hash,role,is_active,must_change_password FROM users WHERE login_id=? LIMIT 1');
+    $s->execute([$identifier]); $u=$s->fetch();
+    $ok = $u && (int)$u['is_active']===1 && password_verify($password,(string)$u['password_hash']);
+    try { $q=$pdo->prepare('INSERT INTO login_attempts(ip_address,login_id,succeeded,attempted_at) VALUES(?,?,?,NOW())'); $q->execute([$ip,$identifier,$ok?1:0]); } catch(Throwable $e) {}
+    if ($ok) {
+        session_regenerate_id(true);
+        $_SESSION['user']=['id'=>(int)$u['id'],'login_id'=>$u['login_id'],'name'=>$u['display_name'],'role'=>$u['role'],'must_change_password'=>(int)$u['must_change_password']];
+        audit($pdo,'login_success','user',(string)$u['id']);
+        redirect(!empty($u['must_change_password']) ? 'change_password' : 'dashboard');
+    }
+    audit($pdo,'login_failure','user',null,['login_id'=>$identifier]);
+    flash('danger','Sign-in failed. Check your register number/username and password.');
+    redirect('login');
+}
+
+if ($action === 'save_answer') {
+    require_role(['student']);
+    header('Content-Type: application/json; charset=utf-8');
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        echo json_encode(['saved'=>false,'message'=>'Answer saves require POST.']);
+        exit;
+    }
+
+    $examId=(int)($_POST['exam_id']??0);$attemptId=(int)($_POST['attempt_id']??0);$questionId=(int)($_POST['question_id']??0);
+    $rawChoice=$_POST['answer']??'';$choice=is_string($rawChoice)?strtoupper(trim($rawChoice)):'invalid';$flagged=$_POST['flagged']??'0';
+    if($examId<1||$attemptId<1||$questionId<1||!in_array($choice,['','A','B','C','D'],true)||!in_array($flagged,['0','1'],true)){
+        http_response_code(422);echo json_encode(['saved'=>false,'message'=>'Invalid answer data.']);exit;
+    }
+
+    try{
+        $s=$pdo->prepare("SELECT e.subject_id,e.status,e.start_at,e.end_at,e.duration_minutes,a.started_at FROM exam_attempts a JOIN exams e ON e.id=a.exam_id LEFT JOIN student_profiles sp ON sp.user_id=a.student_user_id WHERE a.id=? AND a.exam_id=? AND a.student_user_id=? AND a.status='in_progress' AND e.is_archived=0 AND (e.department_id IS NULL OR e.department_id=sp.department_id) AND (e.year_level IS NULL OR e.year_level=sp.year_level)");
+        $s->execute([$attemptId,$examId,current_user()['id']]);$attempt=$s->fetch();
+        if(!$attempt||$attempt['status']!=='active'||strtotime($attempt['start_at'])>time()||strtotime($attempt['end_at'])<time()||time()>min(strtotime($attempt['started_at'])+(int)$attempt['duration_minutes']*60,strtotime($attempt['end_at']))){
+            http_response_code(409);echo json_encode(['saved'=>false,'message'=>'This exam attempt is no longer open.']);exit;
+        }
+        $s=$pdo->prepare('SELECT 1 FROM questions WHERE id=? AND subject_id=?');$s->execute([$questionId,$attempt['subject_id']]);
+        if(!$s->fetchColumn()){http_response_code(422);echo json_encode(['saved'=>false,'message'=>'Question does not belong to this exam.']);exit;}
+        $s=$pdo->prepare('INSERT INTO attempt_answers(attempt_id,question_id,selected_option,is_correct,marks_awarded,is_flagged,saved_at) VALUES(?,?,?,NULL,0,?,NOW()) ON DUPLICATE KEY UPDATE selected_option=VALUES(selected_option),is_flagged=VALUES(is_flagged),saved_at=NOW()');
+        $s->execute([$attemptId,$questionId,$choice?:null,(int)$flagged]);
+        echo json_encode(['saved'=>true]);
+    }catch(Throwable $e){
+        error_log('Cycle Exam answer autosave error: '.$e->getMessage());
+        http_response_code(500);echo json_encode(['saved'=>false,'message'=>'Answer could not be saved.']);
+    }
+    exit;
+}
+
+function page_start(string $title, PDO $pdo, array $config): void {
+    $u=current_user(); $brand=setting($pdo,'institution_name',$config['app_name'] ?? 'Cycle Exam Portal');
+    $logo=setting($pdo,'logo_path','');if($logo==='')$logo='favicon_io/android-chrome-192x192.png';
+    $primary=setting($pdo,'primary_color','#e31825'); $accent=setting($pdo,'accent_color','#ffc20e');
+    $primary=preg_match('/^#[0-9a-fA-F]{6}$/',$primary)?$primary:'#e31825';
+    $accent=preg_match('/^#[0-9a-fA-F]{6}$/',$accent)?$accent:'#ffc20e';
+    echo '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="'.$primary.'"><title>'.e($title).' · '.e($brand).'</title><link rel="icon" href="favicon_io/favicon.ico" sizes="any"><link rel="icon" type="image/png" sizes="32x32" href="favicon_io/favicon-32x32.png"><link rel="icon" type="image/png" sizes="16x16" href="favicon_io/favicon-16x16.png"><link rel="apple-touch-icon" href="favicon_io/apple-touch-icon.png"><link rel="manifest" href="favicon_io/site.webmanifest"><link rel="stylesheet" href="assets/app.css"><style>:root{--primary:'.$primary.';--accent:'.$accent.'}</style></head><body>';
+    echo '<header class="topbar"><a class="brand" href="index.php?action=dashboard">'.($logo?'<img class="logo" src="'.e($logo).'" alt="Logo">':'<span class="logo-placeholder">CE</span>').'<span>'.e($brand).'</span></a>';
+    if($u)     echo '<div class="top-right"><span>'.e($u['name']).' <small>('.e($u['role']).')</small></span><a class="btn btn-light btn-sm" href="index.php?action=profile">My profile</a><a class="btn btn-light btn-sm" href="index.php?action=change_password">Change password</a><a class="btn btn-light btn-sm" href="index.php?action=logout">Sign out</a></div>';
+    echo '</header>';
+    if($u) {
+        echo '<div class="layout"><aside class="sidebar"><div class="nav-label">WORKSPACE</div>';
+        $links = [
+            ['dashboard','Dashboard','▦',['super_admin','exam_admin','student']],
+            ['students','Students','♙',['super_admin','exam_admin']],
+            ['staff','Staff & teachers','♟',['super_admin','exam_admin']],
+            ['subjects','Subjects','▤',['super_admin','exam_admin','teacher']],
+            ['questions','Question bank','?',['super_admin','exam_admin','teacher']],
+            ['exams','Examinations','◷',['super_admin','exam_admin','student']],
+            ['results','Results & reports','▥',['super_admin','exam_admin','student']],
+            ['profile','My profile','♙',['super_admin','exam_admin','teacher','student']],
+            ['change_password','Change password','⚿',['super_admin','exam_admin','teacher','student']],
+            ['settings','Branding & settings','⚙',['super_admin']],
+            ['policies','Policies & rules','☷',['super_admin','exam_admin','student']],
+            ['audit','Audit log','≡',['super_admin']]
+        ];
+        foreach($links as [$key,$label,$ico,$roles]) if(in_array($u['role'],$roles,true)) echo '<a class="nav-link '.($GLOBALS['action']===$key?'active':'').'" href="index.php?action='.$key.'"><span>'.$ico.'</span>'.e($label).'</a>';
+        echo '</aside><main class="content">';
+    } else echo '<main class="auth-main">';
+    if (!empty($_SESSION['flash'])) { $f=$_SESSION['flash']; unset($_SESSION['flash']); echo '<div class="alert alert-'.e($f['type']).'">'.e($f['message']).'</div>'; }
+    echo '<div class="page-heading"><div><h1>'.e($title).'</h1><p class="muted">'.date('l, d M Y').'</p></div></div>';
+}
+function page_end(): void { if(current_user()) echo '</main></div>'; else echo '</main>'; echo '<footer class="footer">Powered by College Cycle Test Portal · Use only for authorized academic examinations.</footer><script src="assets/app.js"></script></body></html>'; }
+function post_field(string $name, string $label, string $type='text', string $value='', bool $required=false, string $attrs=''): void {
+    echo '<label class="field"><span>'.e($label).'</span><input type="'.e($type).'" name="'.e($name).'" value="'.e($value).'" '.($required?'required':'').' '.$attrs.'></label>';
+}
+function csrf_input(): void { echo '<input type="hidden" name="csrf" value="'.e(csrf_token()).'">'; }
+function finalize_exam_attempt(PDO $pdo, int $examId, int $studentId, array $attempt, array $exam, array $answers, array $flags, bool $expired): void {
+    if ($expired) $answers = [];
+    $pdo->beginTransaction();
+    try {
+        $q=$pdo->prepare('SELECT id,correct_option,marks FROM questions WHERE subject_id=?');$q->execute([$exam['subject_id']]);$questionRows=$q->fetchAll();$map=[];foreach($questionRows as $row)$map[(int)$row['id']]=$row;
+        $savedAnswers=[];$savedFlags=[];$s=$pdo->prepare('SELECT question_id,selected_option,is_flagged FROM attempt_answers WHERE attempt_id=?');$s->execute([$attempt['id']]);foreach($s->fetchAll() as $saved){$qid=(int)$saved['question_id'];$savedAnswers[$qid]=$saved['selected_option'];$savedFlags[$qid]=(int)$saved['is_flagged'];}
+        $score=0.0;$max=0.0;
+        foreach($map as $qid=>$row){$max+=(float)$row['marks'];$submitted=$expired?($savedAnswers[$qid]??''):($answers[$qid]??'');$choice=is_string($submitted)?strtoupper($submitted):'';$choice=in_array($choice,['A','B','C','D'],true)?$choice:'';$flagInput=$flags[$qid]??($savedFlags[$qid]??0);$isFlagged=$flagInput===1||$flagInput==='1';$correct=$choice!==''&&$choice===$row['correct_option'];$awarded=$correct?(float)$row['marks']:0.0;$ins=$pdo->prepare('INSERT INTO attempt_answers(attempt_id,question_id,selected_option,is_correct,marks_awarded,is_flagged,saved_at) VALUES(?,?,?,?,?,?,NOW()) ON DUPLICATE KEY UPDATE selected_option=VALUES(selected_option),is_correct=VALUES(is_correct),marks_awarded=VALUES(marks_awarded),is_flagged=VALUES(is_flagged),saved_at=NOW()');$ins->execute([$attempt['id'],$qid,$choice?:null,$correct?1:0,$awarded,$isFlagged?1:0]);$score+=$awarded;}
+        $s=$pdo->prepare("UPDATE exam_attempts SET status='submitted',submitted_at=NOW(),marks_obtained=?,max_marks=? WHERE id=? AND exam_id=? AND student_user_id=? AND status='in_progress'");$s->execute([$score,$max,$attempt['id'],$examId,$studentId]);
+        if($s->rowCount()!==1)throw new RuntimeException('Attempt could not be finalized because its status changed.');
+        $pct=$max>0?($score/$max*100):0;$pdo->prepare('INSERT INTO results(exam_id,student_user_id,attempt_id,marks_obtained,max_marks,percentage,is_published,created_at) VALUES(?,?,?,?,?,?,0,NOW()) ON DUPLICATE KEY UPDATE marks_obtained=VALUES(marks_obtained),max_marks=VALUES(max_marks),percentage=VALUES(percentage)')->execute([$examId,$studentId,$attempt['id'],$score,$max,$pct]);
+        $pdo->commit();audit($pdo,'exam_submitted','attempt',(string)$attempt['id'],['automatic'=>$expired]);
+    }catch(Throwable $e){if($pdo->inTransaction())$pdo->rollBack();throw $e;}
+}
+
+if ($action === 'login') {
+    $brand=setting($pdo,'institution_name',$config['app_name'] ?? 'College Cycle Test Portal');
+    $logo=setting($pdo,'logo_path','');
+    if($logo==='')$logo='favicon_io/android-chrome-192x192.png';
+    $primary=setting($pdo,'primary_color','#e31825');$accent=setting($pdo,'accent_color','#ffc20e');
+    $primary=preg_match('/^#[0-9a-fA-F]{6}$/',$primary)?$primary:'#e31825';$accent=preg_match('/^#[0-9a-fA-F]{6}$/',$accent)?$accent:'#ffc20e';
+    echo '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="'.$primary.'"><title>Sign in · '.e($brand).'</title><link rel="icon" href="favicon_io/favicon.ico" sizes="any"><link rel="icon" type="image/png" sizes="32x32" href="favicon_io/favicon-32x32.png"><link rel="icon" type="image/png" sizes="16x16" href="favicon_io/favicon-16x16.png"><link rel="apple-touch-icon" href="favicon_io/apple-touch-icon.png"><link rel="manifest" href="favicon_io/site.webmanifest"><link rel="stylesheet" href="assets/app.css"><style>:root{--primary:'.$primary.';--accent:'.$accent.'}</style></head><body class="login-body"><div class="login-wrap"><div class="login-brand"><img class="login-logo" src="'.e($logo).'" alt="'.e($brand).' logo"><h1>'.e($brand).'</h1><p>Monthly cycle tests · Student examination portal</p></div>';
+    if(!empty($_SESSION['flash'])){$f=$_SESSION['flash'];unset($_SESSION['flash']);echo '<div class="alert alert-'.e($f['type']).'">'.e($f['message']).'</div>';}
+    echo '<form method="post" action="index.php?action=login" class="card login-card"><input type="hidden" name="csrf" value="'.e(csrf_token()).'"><h2>Sign in</h2><p class="muted">Student accounts are created by your college administrator. Sign in with the register number and temporary password they provided. Staff: use your assigned username.</p><label class="field"><span>Register number / username</span><input name="identifier" autocomplete="username" required maxlength="100"></label><label class="field"><span>Password</span><input type="password" name="password" autocomplete="current-password" required></label><button class="btn btn-primary btn-block" type="submit">Sign in securely</button><p class="small muted">You will be asked to change a temporary password at first sign-in. For account access or a password reset, contact your college examination administrator.</p></form><p class="login-policy"><a href="index.php?action=public_policies">Privacy policy & examination rules</a></p></div><script src="assets/app.js"></script></body></html>';
+    exit;
+}
+
+$titleMap=['dashboard'=>'Dashboard','profile'=>'My profile','change_password'=>'Change password','students'=>'Student management','staff'=>'Staff & teachers','student_import'=>'Import students','subjects'=>'Subjects','questions'=>'Question bank','exams'=>'Examinations','take_exam'=>'Take examination','results'=>'Results & reports','settings'=>'Institution branding & settings','policies'=>'Policies & examination rules','audit'=>'Audit log','public_policies'=>'Policies & examination rules'];
+page_start($titleMap[$action] ?? 'Cycle Test Portal',$pdo,$config);
+
+switch($action) {
+case 'dashboard':
+    $role=current_user()['role'];
+    if($role==='student') {
+        $sid=(int)current_user()['id'];
+        $s=$pdo->prepare("SELECT e.*,s.subject_name FROM exams e JOIN subjects s ON s.id=e.subject_id LEFT JOIN student_profiles sp ON sp.user_id=? WHERE e.status IN ('scheduled','active','closed','published') AND (e.department_id IS NULL OR e.department_id=sp.department_id) AND (e.year_level IS NULL OR e.year_level=sp.year_level) AND e.is_archived=0 ORDER BY e.start_at DESC LIMIT 20"); $s->execute([$sid]); $exams=$s->fetchAll();
+        echo '<div class="card"><h2>Your examinations</h2><div class="table-wrap"><table><thead><tr><th>Exam</th><th>Subject</th><th>Starts</th><th>Duration</th><th>Status</th><th></th></tr></thead><tbody>';
+        foreach($exams as $ex){$a=$pdo->prepare('SELECT id,status,started_at FROM exam_attempts WHERE exam_id=? AND student_user_id=? LIMIT 1');$a->execute([$ex['id'],$sid]);$attempt=$a->fetch()?:null;$access=student_exam_access($ex,$attempt);echo '<tr><td>'.e($ex['title']).'</td><td>'.e($ex['subject_name']).'</td><td>'.e($ex['start_at']).'</td><td>'.(int)$ex['duration_minutes'].' min</td><td><span class="pill">'.e($access['label']).'</span></td><td>'.($access['action']?'<a class="btn btn-primary btn-sm" href="index.php?action=take_exam&id='.(int)$ex['id'].'">'.e($access['action']).'</a>':'—').'</td></tr>';}
+        if(!$exams)echo '<tr><td colspan="6">No examinations are currently assigned to your group.</td></tr>';
+        echo '</tbody></table></div></div>';
+        echo '<div class="card"><h2>Recent published results</h2>'; $r=$pdo->prepare("SELECT e.title,r.marks_obtained,r.max_marks,r.percentage,r.published_at FROM results r JOIN exams e ON e.id=r.exam_id WHERE r.student_user_id=? AND r.is_published=1 ORDER BY r.published_at DESC LIMIT 10");$r->execute([$sid]);$rows=$r->fetchAll();echo '<div class="table-wrap"><table><thead><tr><th>Exam</th><th>Marks</th><th>Percentage</th><th>Published</th></tr></thead><tbody>';foreach($rows as $x)echo '<tr><td>'.e($x['title']).'</td><td>'.e($x['marks_obtained']).' / '.e($x['max_marks']).'</td><td>'.number_format((float)$x['percentage'],2).'%</td><td>'.e($x['published_at']).'</td></tr>';if(!$rows)echo '<tr><td colspan="4">No published results yet.</td></tr>';echo '</tbody></table></div></div>';
+    } else {
+        $counts=[]; foreach(['users'=>'SELECT COUNT(*) FROM users WHERE role="student" AND is_active=1','subjects'=>'SELECT COUNT(*) FROM subjects WHERE is_active=1','exams'=>'SELECT COUNT(*) FROM exams WHERE is_archived=0','attempts'=>'SELECT COUNT(*) FROM exam_attempts','pending'=>'SELECT COUNT(*) FROM exam_attempts WHERE status="submitted"'] as $k=>$sql){try{$counts[$k]=(int)$pdo->query($sql)->fetchColumn();}catch(Throwable $e){$counts[$k]=0;}}
+        echo '<div class="stats-grid">';foreach(['users'=>'Active students','subjects'=>'Subjects','exams'=>'Examinations','attempts'=>'Exam attempts','pending'=>'Pending evaluation'] as $k=>$v)echo '<div class="stat-card"><span>'.e($v).'</span><strong>'.number_format($counts[$k]??0).'</strong></div>';echo '</div>';
+        echo '<div class="quick-grid"><a class="quick-card" href="index.php?action=students"><b>♙ Student management</b><span>Add students or import a CSV list.</span></a><a class="quick-card" href="index.php?action=questions"><b>? Question bank</b><span>Create and maintain MCQ questions.</span></a><a class="quick-card" href="index.php?action=exams"><b>◷ Schedule cycle test</b><span>Create monthly exams and assign groups.</span></a><a class="quick-card" href="index.php?action=results"><b>▥ Results and reports</b><span>Review submissions and publish results.</span></a></div>';
+        echo '<div class="card"><h2>Upcoming examinations</h2>'; $rows=$pdo->query("SELECT e.id,e.title,e.start_at,e.end_at,e.status,s.subject_name FROM exams e JOIN subjects s ON s.id=e.subject_id WHERE e.is_archived=0 AND e.end_at>=NOW() ORDER BY e.start_at LIMIT 8")->fetchAll();echo '<div class="table-wrap"><table><thead><tr><th>Exam</th><th>Subject</th><th>Start</th><th>End</th><th>Status</th></tr></thead><tbody>';foreach($rows as $r)echo '<tr><td>'.e($r['title']).'</td><td>'.e($r['subject_name']).'</td><td>'.e($r['start_at']).'</td><td>'.e($r['end_at']).'</td><td><span class="pill">'.e($r['status']).'</span></td></tr>';if(!$rows)echo '<tr><td colspan="5">No upcoming examinations.</td></tr>';echo '</tbody></table></div></div>';
+    }
+    break;
+
+case 'profile':
+    require_login();
+    $userId=(int)current_user()['id'];$student=current_user()['role']==='student';$profile=null;
+    if($student){$s=$pdo->prepare('SELECT register_number,email,phone FROM student_profiles WHERE user_id=?');$s->execute([$userId]);$profile=$s->fetch();if(!$profile){http_response_code(409);echo '<div class="alert alert-danger">Your student profile is missing. Contact the examination administrator to repair the account.</div>';break;}}
+    if($_SERVER['REQUEST_METHOD']==='POST'){
+        $name=trim((string)($_POST['display_name']??''));$email=trim((string)($_POST['email']??''));$phone=trim((string)($_POST['phone']??''));
+        if($name===''||strlen($name)>180||($student&&((strlen($email)>190)||($email!==''&&!filter_var($email,FILTER_VALIDATE_EMAIL))||strlen($phone)>40))){
+            flash('danger','Enter a name and valid email/phone values within the allowed lengths.');redirect('profile');
+        }
+        try{
+            $pdo->beginTransaction();$pdo->prepare('UPDATE users SET display_name=?,updated_at=NOW() WHERE id=?')->execute([$name,$userId]);
+            if($student)$pdo->prepare('UPDATE student_profiles SET email=?,phone=? WHERE user_id=?')->execute([$email?:null,$phone?:null,$userId]);
+            $pdo->commit();$_SESSION['user']['name']=$name;audit($pdo,'profile_updated','user',(string)$userId);flash('success','Profile updated.');redirect('profile');
+        }catch(Throwable $e){if($pdo->inTransaction())$pdo->rollBack();error_log('Cycle Exam profile update error: '.$e->getMessage());flash('danger','Profile could not be saved. Please try again.');redirect('profile');}
+    }
+    $s=$pdo->prepare('SELECT login_id,display_name,role FROM users WHERE id=?');$s->execute([$userId]);$account=$s->fetch();
+    echo '<div class="card narrow"><h2>Account profile</h2><p class="muted">Account ID and role are managed by your institution.</p><div class="profile-account"><p><b>Login / register number:</b> '.e($student?($profile['register_number']??''):$account['login_id']).'</p><p><b>Role:</b> '.e($account['role']).'</p></div><form method="post">';csrf_input();post_field('display_name','Display name','text',(string)$account['display_name'],true,'maxlength="180"');if($student){post_field('email','Email address','email',(string)($profile['email']??''),false,'maxlength="190"');post_field('phone','Phone number','tel',(string)($profile['phone']??''),false,'maxlength="40"');}echo '<button class="btn btn-primary">Save profile</button></form><p class="small muted">To change your password, use the Change password link in the top bar.</p></div>';
+    break;
+
+case 'change_password':
+    require_login();
+    if($_SERVER['REQUEST_METHOD']==='POST'){
+        $pw=(string)($_POST['password']??'');$confirm=(string)($_POST['confirm']??'');
+        if(strlen($pw)<10 || !preg_match('/[A-Za-z]/',$pw) || !preg_match('/[0-9]/',$pw) || $pw!==$confirm) flash('danger','Use at least 10 characters including a letter and a number; both entries must match.');
+        else{$s=$pdo->prepare('UPDATE users SET password_hash=?,must_change_password=0,updated_at=NOW() WHERE id=?');$s->execute([password_hash($pw,PASSWORD_DEFAULT),current_user()['id']]);$_SESSION['user']['must_change_password']=0;audit($pdo,'password_changed','user',(string)current_user()['id']);flash('success','Password updated.');redirect('dashboard');}
+    }
+    echo '<div class="card narrow"><p>Choose a new password. Use at least 10 characters, including a letter and a number.</p><form method="post">';csrf_input();post_field('password','New password','password','',true,'minlength="10"');post_field('confirm','Confirm password','password','',true,'minlength="10"');echo '<button class="btn btn-primary">Update password</button></form></div>';
+    break;
+
+case 'students':
+    require_role(['super_admin','exam_admin']);
+    if($_SERVER['REQUEST_METHOD']==='POST'){
+        require_role(['super_admin']);
+        $name=trim((string)($_POST['display_name']??''));$reg=trim((string)($_POST['register_number']??''));$dept=trim((string)($_POST['department']??''));$year=trim((string)($_POST['year_level']??''));$section=trim((string)($_POST['section']??''));
+        if(!$name||!$reg)flash('danger','Name and register number are required.');
+        else {try{$pdo->beginTransaction();$s=$pdo->prepare('INSERT INTO users(login_id,display_name,password_hash,role,is_active,must_change_password,created_at,updated_at) VALUES(?,?,?, ?,1,1,NOW(),NOW())');$temp=bin2hex(random_bytes(8));$s->execute([$reg,$name,password_hash($temp,PASSWORD_DEFAULT),'student']);$uid=(int)$pdo->lastInsertId();$d=null;if($dept!==''){$q=$pdo->prepare('SELECT id FROM departments WHERE department_name=?');$q->execute([$dept]);$d=$q->fetchColumn();if(!$d){$q=$pdo->prepare('INSERT INTO departments(department_name) VALUES(?)');$q->execute([$dept]);$d=$pdo->lastInsertId();}}$q=$pdo->prepare('INSERT INTO student_profiles(user_id,register_number,department_id,year_level,section_name) VALUES(?,?,?,?,?)');$q->execute([$uid,$reg,$d,$year?:null,$section?:null]);$pdo->commit();audit($pdo,'student_created','user',(string)$uid);flash('warning','Student account created. Register number: '.$reg.'. One-time temporary password: '.$temp.'. Share these credentials privately; the student must change the password at first sign-in. This password is shown only once.');}catch(Throwable $e){if($pdo->inTransaction())$pdo->rollBack();flash('danger','Student could not be created. Check whether the register number already exists.');error_log($e->getMessage());}}
+        redirect('students');
+    }
+    $q=trim((string)($_GET['q']??''));$sql="SELECT u.id,u.display_name,u.login_id,u.is_active,sp.year_level,sp.section_name,d.department_name FROM users u LEFT JOIN student_profiles sp ON sp.user_id=u.id LEFT JOIN departments d ON d.id=sp.department_id WHERE u.role='student'";$params=[];if($q!==''){$sql.=" AND (u.display_name LIKE ? OR u.login_id LIKE ?)";$params=["%$q%","%$q%"];} $sql.=" ORDER BY u.display_name LIMIT 100";$s=$pdo->prepare($sql);$s->execute($params);$rows=$s->fetchAll();
+    if(current_user()['role']==='super_admin')echo '<div class="card"><h2>Add a student</h2><p class="muted">A unique temporary password is generated for each student and shown once after creation. Share it privately; the student must change it at first sign-in.</p><form method="post" class="form-grid">';if(current_user()['role']==='super_admin'){csrf_input();post_field('display_name','Student name','text','',true);post_field('register_number','Register number','text','',true);post_field('department','Department','text');post_field('year_level','Year / level','text');post_field('section','Section / batch','text');echo '<div class="form-actions"><button class="btn btn-primary">Create student</button><a class="btn btn-light" href="index.php?action=student_import">Import CSV</a><a class="btn btn-light" href="index.php?action=student_template">Download template</a></div></form></div>';}
+    echo '<div class="card"><div class="card-title-row"><h2>Students</h2><form class="inline-search"><input name="q" value="'.e($q).'" placeholder="Search name or register number"><input type="hidden" name="action" value="students"><button class="btn btn-light">Search</button></form></div><div class="table-wrap"><table><thead><tr><th>Name</th><th>Register number</th><th>Department</th><th>Year</th><th>Section</th><th>Status</th><th>Action</th></tr></thead><tbody>';foreach($rows as $r){echo '<tr><td>'.e($r['display_name']).'</td><td>'.e($r['login_id']).'</td><td>'.e($r['department_name']??'—').'</td><td>'.e($r['year_level']??'—').'</td><td>'.e($r['section_name']??'—').'</td><td>'.((int)$r['is_active']?'Active':'Inactive').'</td><td><div class="inline-form"><form method="post" action="index.php?action=toggle_student">';csrf_input();echo '<input type="hidden" name="id" value="'.(int)$r['id'].'"><button class="btn btn-light btn-sm">'.((int)$r['is_active']?'Deactivate':'Activate').'</button></form><form method="post" action="index.php?action=reset_student_password" onsubmit="return confirm(&quot;Generate a one-time temporary password?&quot;)">';csrf_input();echo '<input type="hidden" name="id" value="'.(int)$r['id'].'"><button class="btn btn-light btn-sm">Reset password</button></form></div></td></tr>';}if(!$rows)echo '<tr><td colspan="7">No students found.</td></tr>';echo '</tbody></table></div><p class="muted small">Showing up to 100 rows. Search to narrow the list. Historical exam records are preserved.</p></div>';
+    break;
+
+case 'staff':
+    require_role(['super_admin','exam_admin']);
+    if($_SERVER['REQUEST_METHOD']==='POST'){
+        require_role(['super_admin']);
+        $name=trim((string)($_POST['display_name']??''));$login=trim((string)($_POST['login_id']??''));$role=(string)($_POST['role']??'teacher');
+        $allowedRoles=current_user()['role']==='super_admin'?['teacher','exam_admin']:['teacher'];
+        if($name===''||strlen($name)>180||$login===''||strlen($login)>100||!in_array($role,$allowedRoles,true)){
+            flash('danger','Enter a valid name and login ID, then choose a role you are authorized to create.');redirect('staff');
+        }
+        try{
+            $temp=bin2hex(random_bytes(8));
+            $s=$pdo->prepare('INSERT INTO users(login_id,display_name,password_hash,role,is_active,must_change_password,created_at,updated_at) VALUES(?,?,?,?,1,1,NOW(),NOW())');
+            $s->execute([$login,$name,password_hash($temp,PASSWORD_DEFAULT),$role]);
+            $id=(int)$pdo->lastInsertId();audit($pdo,'staff_created','user',(string)$id,['role'=>$role]);
+            flash('warning',ucfirst(str_replace('_',' ',$role)).' account created. Login ID: '.$login.'. One-time temporary password: '.$temp.'. Share these credentials privately; the user must change the password at first sign-in. This password is shown only once.');
+        }catch(Throwable $e){error_log('Cycle Exam staff account creation error: '.$e->getMessage());flash('danger','Account could not be created. Check whether the login ID is already in use.');}
+        redirect('staff');
+    }
+    $isSuperAdmin=current_user()['role']==='super_admin';
+    $allowedRoles=['teacher','exam_admin'];
+    $staffSql="SELECT id,login_id,display_name,role,is_active FROM users WHERE role IN ('teacher','exam_admin')";
+    if(!$isSuperAdmin)$staffSql.=" AND role='teacher'";
+    $staffSql.=" ORDER BY role,display_name";
+    $s=$pdo->query($staffSql);
+    $rows=$s->fetchAll();
+    if($isSuperAdmin){echo '<div class="card"><h2>Create staff account</h2><p class="muted">Create a login for a teacher or authorized examination staff member. A temporary password is generated and shown once; the user must change it at first sign-in.</p><form method="post" class="form-grid">';csrf_input();post_field('display_name','Staff / teacher name','text','',true,'maxlength="180"');post_field('login_id','Login ID','text','',true,'maxlength="100"');echo '<label class="field"><span>Role</span><select name="role" required>';foreach($allowedRoles as $role)echo '<option value="'.e($role).'">'.e(ucfirst(str_replace('_',' ',$role))).'</option>';echo '</select></label><div class="form-actions"><button class="btn btn-primary">Create account</button></div></form></div>';}
+    else echo '<div class="card"><p class="muted">Exam admins can manage teacher access and reset teacher passwords. Only a super admin can create staff accounts or manage exam-admin accounts.</p></div>';
+    echo '<div class="card"><h2>Staff and teacher accounts</h2><div class="table-wrap"><table><thead><tr><th>Name</th><th>Login ID</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead><tbody>';
+    foreach($rows as $r){$targetId=(int)$r['id'];$isSelf=$targetId===(int)current_user()['id'];$canManage=(!$isSelf)&&($isSuperAdmin||$r['role']==='teacher');echo '<tr><td>'.e($r['display_name']).'</td><td>'.e($r['login_id']).'</td><td>'.e(ucfirst(str_replace('_',' ',$r['role']))).'</td><td>'.((int)$r['is_active']?'Active':'Inactive').'</td><td>';if($canManage){echo '<div class="inline-form"><form method="post" action="index.php?action=toggle_staff">';csrf_input();echo '<input type="hidden" name="id" value="'.$targetId.'"><button class="btn btn-light btn-sm">'.((int)$r['is_active']?'Deactivate':'Activate').'</button></form><form method="post" action="index.php?action=reset_staff_password" onsubmit="return confirm(&quot;Generate a one-time temporary password?&quot;)">';csrf_input();echo '<input type="hidden" name="id" value="'.$targetId.'"><button class="btn btn-light btn-sm">Reset password</button></form></div>';}else echo '<span class="muted small">'.($isSelf?'Your own account':'Managed by a super admin').'</span>';echo '</td></tr>';}
+    if(!$rows)echo '<tr><td colspan="5">No staff or teacher accounts found.</td></tr>';echo '</tbody></table></div></div>';
+    break;
+
+case 'toggle_staff':
+    require_role(['super_admin','exam_admin']);
+    $id=(int)($_POST['id']??0);$s=$pdo->prepare("SELECT role FROM users WHERE id=? AND role IN ('teacher','exam_admin')");$s->execute([$id]);$targetRole=$s->fetchColumn();
+    if(!$targetRole||$id===(int)current_user()['id']||(current_user()['role']==='exam_admin'&&$targetRole!=='teacher')){flash('danger','You are not authorized to change this account.');redirect('staff');}
+    $s=$pdo->prepare('UPDATE users SET is_active=IF(is_active=1,0,1),updated_at=NOW() WHERE id=?');$s->execute([$id]);audit($pdo,'staff_status_toggled','user',(string)$id,['role'=>$targetRole]);flash('success','Staff account status updated.');redirect('staff');
+
+case 'reset_staff_password':
+    require_role(['super_admin','exam_admin']);
+    $id=(int)($_POST['id']??0);$s=$pdo->prepare("SELECT role FROM users WHERE id=? AND role IN ('teacher','exam_admin')");$s->execute([$id]);$targetRole=$s->fetchColumn();
+    if(!$targetRole||$id===(int)current_user()['id']||(current_user()['role']==='exam_admin'&&$targetRole!=='teacher')){flash('danger','You are not authorized to reset this account.');redirect('staff');}
+    $temp=bin2hex(random_bytes(6));$s=$pdo->prepare('UPDATE users SET password_hash=?,must_change_password=1,updated_at=NOW() WHERE id=?');$s->execute([password_hash($temp,PASSWORD_DEFAULT),$id]);audit($pdo,'staff_password_reset','user',(string)$id,['role'=>$targetRole]);flash('warning','One-time temporary password: '.$temp.'. Share it securely; the user must change it at first sign-in. This password is shown only once.');redirect('staff');
+
+case 'toggle_student':
+    require_role(['super_admin','exam_admin']);
+    $id=(int)($_POST['id']??0);$s=$pdo->prepare("UPDATE users SET is_active=IF(is_active=1,0,1),updated_at=NOW() WHERE id=? AND role='student'");$s->execute([$id]);audit($pdo,'student_status_toggled','user',(string)$id);flash('success','Student status updated.');redirect('students');
+
+case 'reset_student_password':
+    require_role(['super_admin','exam_admin']);
+    $id=(int)($_POST['id']??0);$temp=bin2hex(random_bytes(6));$s=$pdo->prepare("UPDATE users SET password_hash=?,must_change_password=1,updated_at=NOW() WHERE id=? AND role='student'");$s->execute([password_hash($temp,PASSWORD_DEFAULT),$id]);if($s->rowCount()){audit($pdo,'student_password_reset','user',(string)$id);flash('warning','One-time temporary password for this student: '.$temp.'. Share it securely and ask the student to change it immediately. It will not be shown again.');}else{flash('danger','Student account was not found.');}redirect('students');
+
+case 'student_template':
+    require_role(['super_admin']);
+    header('Content-Type: text/csv; charset=utf-8');header('Content-Disposition: attachment; filename="student_import_template.csv"');$out=fopen('php://output','w');fputcsv($out,['register_number','student_name','department','year_level','section']);fputcsv($out,['REG2026001','Example Student','Computer Science','1','A']);fclose($out);exit;
+
+case 'student_import':
+    require_role(['super_admin']);
+    if($_SERVER['REQUEST_METHOD']==='POST'){
+        if(empty($_FILES['csv']['tmp_name'])||($_FILES['csv']['error']??UPLOAD_ERR_NO_FILE)!==UPLOAD_ERR_OK) {flash('danger','Choose a valid CSV file.');redirect('student_import');}
+        if((int)$_FILES['csv']['size']>((int)($config['max_upload_mb']??5)*1024*1024)){flash('danger','File exceeds the upload size limit.');redirect('student_import');}
+        $f=fopen($_FILES['csv']['tmp_name'],'r');$header=fgetcsv($f);$header=array_map(fn($x)=>strtolower(trim(preg_replace('/^\\xEF\\xBB\\xBF/', '', (string)$x))), (array)$header);$required=['register_number','student_name'];if(array_diff($required,$header)){fclose($f);flash('danger','CSV must contain register_number and student_name columns. Download the template.');redirect('student_import');}
+        $idx=array_flip($header);$seen=[];$inserted=0;$skipped=0;$errors=[];$rowNum=1;
+        while(($row=fgetcsv($f))!==false){$rowNum++;$reg=trim((string)($row[$idx['register_number']]??''));$name=trim((string)($row[$idx['student_name']]??''));$dept=trim((string)($row[$idx['department']]??''));$year=trim((string)($row[$idx['year_level']]??''));$section=trim((string)($row[$idx['section']]??''));
+            if($reg===''||$name===''){$errors[]="Row $rowNum: register number and student name are required.";continue;}if(isset($seen[$reg])){$errors[]="Row $rowNum: duplicate register number in file.";continue;}$seen[$reg]=true;
+            try{$pdo->beginTransaction();$check=$pdo->prepare('SELECT id FROM users WHERE login_id=?');$check->execute([$reg]);if($check->fetchColumn()){$pdo->rollBack();$skipped++;continue;}
+                $s=$pdo->prepare('INSERT INTO users(login_id,display_name,password_hash,role,is_active,must_change_password,created_at,updated_at) VALUES(?,?,?, ?,1,1,NOW(),NOW())');$temp=bin2hex(random_bytes(12));$s->execute([$reg,$name,password_hash($temp,PASSWORD_DEFAULT),'student']);$uid=(int)$pdo->lastInsertId();$deptId=null;if($dept!==''){$d=$pdo->prepare('SELECT id FROM departments WHERE department_name=?');$d->execute([$dept]);$deptId=$d->fetchColumn();if(!$deptId){$d=$pdo->prepare('INSERT INTO departments(department_name) VALUES(?)');$d->execute([$dept]);$deptId=(int)$pdo->lastInsertId();}}$p=$pdo->prepare('INSERT INTO student_profiles(user_id,register_number,department_id,year_level,section_name) VALUES(?,?,?,?,?)');$p->execute([$uid,$reg,$deptId,$year?:null,$section?:null]);$pdo->commit();$inserted++;
+            }catch(Throwable $e){if($pdo->inTransaction())$pdo->rollBack();$errors[]="Row $rowNum: import failed (possibly a duplicate).";error_log($e->getMessage());}
+        }fclose($f);audit($pdo,'student_csv_import','students',null,['inserted'=>$inserted,'skipped'=>$skipped,'errors'=>count($errors)]);$_SESSION['import_result']=['inserted'=>$inserted,'skipped'=>$skipped,'errors'=>$errors];redirect('student_import');
+    }
+    echo '<div class="card narrow"><p>Import students from a UTF-8 CSV file. Download the template first. Existing register numbers are skipped; passwords are not imported.</p><form method="post" enctype="multipart/form-data">';csrf_input();echo '<label class="field"><span>CSV file</span><input type="file" name="csv" accept=".csv,text/csv" required></label><button class="btn btn-primary">Validate and import CSV</button></form><p class="muted small">For Excel, open the workbook and choose Save As → CSV UTF-8. XLSX parsing can be added with PhpSpreadsheet if Composer is available.</p></div>';
+    if(!empty($_SESSION['import_result'])){$r=$_SESSION['import_result'];unset($_SESSION['import_result']);echo '<div class="card"><h2>Import summary</h2><p>Inserted: <b>'.(int)$r['inserted'].'</b> · Skipped existing: <b>'.(int)$r['skipped'].'</b> · Errors: <b>'.count($r['errors']).'</b></p><ul>';foreach(array_slice($r['errors'],0,100) as $err)echo '<li>'.e($err).'</li>';echo '</ul></div>';}
+    break;
+
+case 'subjects':
+    require_role(['super_admin','exam_admin','teacher']);
+    $canManageSubjects=in_array(current_user()['role'],['super_admin','exam_admin'],true);
+    if($_SERVER['REQUEST_METHOD']==='POST'){
+        require_role(['super_admin','exam_admin']);$name=trim((string)($_POST['subject_name']??''));$code=trim((string)($_POST['subject_code']??''));$id=(int)($_POST['subject_id']??0);
+        if($name===''||strlen($name)>180||strlen($code)>80){flash('danger','Enter a subject name (up to 180 characters) and code (up to 80 characters).');if($id){header('Location: index.php?action=subjects&edit='.$id);exit;}redirect('subjects');}
+        try{
+            if($id){$s=$pdo->prepare('UPDATE subjects SET subject_name=?,subject_code=? WHERE id=?');$s->execute([$name,$code?:null,$id]);if(!$s->rowCount()){ $s=$pdo->prepare('SELECT id FROM subjects WHERE id=?');$s->execute([$id]);if(!$s->fetchColumn())throw new RuntimeException('Subject not found.');}audit($pdo,'subject_updated','subject',(string)$id);flash('success','Subject updated.');}
+            else{$s=$pdo->prepare('INSERT INTO subjects(subject_name,subject_code,is_active,created_at) VALUES(?,?,1,NOW())');$s->execute([$name,$code?:null]);audit($pdo,'subject_created','subject',(string)$pdo->lastInsertId());flash('success','Subject created.');}
+        }catch(Throwable $e){error_log('Cycle Exam subject save error: '.$e->getMessage());flash('danger','Subject could not be saved. Check that the subject code is not already used.');}
+        redirect('subjects');
+    }
+    $editId=(int)($_GET['edit']??0);$editSubject=null;if($editId){$s=$pdo->prepare('SELECT * FROM subjects WHERE id=?');$s->execute([$editId]);$editSubject=$s->fetch()?:null;}
+    if($editId&&!$editSubject)echo '<div class="alert alert-danger">Subject not found.</div>';
+    if($canManageSubjects){echo '<div class="card"><h2>'.($editSubject?'Edit subject':'Add subject').'</h2><form method="post" class="form-grid">';csrf_input();if($editSubject)echo '<input type="hidden" name="subject_id" value="'.(int)$editSubject['id'].'">';post_field('subject_name','Subject name','text',(string)($editSubject['subject_name']??''),true,'maxlength="180"');post_field('subject_code','Subject code','text',(string)($editSubject['subject_code']??''),false,'maxlength="80"');echo '<div class="form-actions"><button class="btn btn-primary">'.($editSubject?'Save subject':'Add subject').'</button>'.($editSubject?'<a class="btn btn-light" href="index.php?action=subjects">Cancel</a>':'').'</div></form></div>';}
+    $rows=$pdo->query('SELECT * FROM subjects ORDER BY subject_name')->fetchAll();echo '<div class="card"><h2>Subjects</h2><div class="table-wrap"><table><thead><tr><th>Subject</th><th>Code</th><th>Status</th>';if($canManageSubjects)echo '<th>Action</th>';echo '</tr></thead><tbody>';foreach($rows as $r){echo '<tr><td>'.e($r['subject_name']).'</td><td>'.e($r['subject_code']??'—').'</td><td>'.((int)$r['is_active']?'Active':'Inactive').'</td>';if($canManageSubjects)echo '<td><a class="btn btn-light btn-sm" href="index.php?action=subjects&edit='.(int)$r['id'].'">Edit</a></td>';echo '</tr>';}if(!$rows)echo '<tr><td colspan="'.($canManageSubjects?4:3).'">No subjects added yet.</td></tr>';echo '</tbody></table></div></div>';
+    break;
+
+case 'questions':
+    require_role(['super_admin','exam_admin','teacher']);
+    $canManageQuestions=in_array(current_user()['role'],['super_admin','exam_admin','teacher'],true);
+    if($_SERVER['REQUEST_METHOD']==='POST'){
+        require_role(['super_admin','exam_admin','teacher']);$id=(int)($_POST['question_id']??0);$subject=(int)($_POST['subject_id']??0);$text=trim((string)($_POST['question_text']??''));$a=trim((string)($_POST['option_a']??''));$b=trim((string)($_POST['option_b']??''));$c=trim((string)($_POST['option_c']??''));$d=trim((string)($_POST['option_d']??''));$correct=strtoupper((string)($_POST['correct_option']??''));$marks=filter_var($_POST['marks']??null,FILTER_VALIDATE_FLOAT);
+        if(!$subject||$text===''||$a===''||$b===''||$c===''||$d===''||!in_array($correct,['A','B','C','D'],true)||$marks===false||$marks<=0){flash('danger','Complete all question fields, enter positive marks, and select the correct option.');if($id){header('Location: index.php?action=questions&edit='.$id);exit;}redirect('questions');}
+        else{
+            $s=$pdo->prepare('SELECT id FROM subjects WHERE id=? AND is_active=1');$s->execute([$subject]);$validSubject=$s->fetchColumn();
+            if(!$validSubject){flash('danger','Choose an active subject.');if($id){header('Location: index.php?action=questions&edit='.$id);exit;}redirect('questions');}
+            try{
+                if($id){
+                    $s=$pdo->prepare('SELECT id FROM questions WHERE id=?');$s->execute([$id]);if(!$s->fetchColumn())throw new RuntimeException('Question not found.');
+                    $s=$pdo->prepare('SELECT COUNT(*) FROM attempt_answers WHERE question_id=?');$s->execute([$id]);$hasSavedAnswer=(int)$s->fetchColumn()>0;
+                    $s=$pdo->prepare('SELECT COUNT(*) FROM exam_attempts ea JOIN exams e ON e.id=ea.exam_id JOIN questions q ON q.subject_id=e.subject_id WHERE q.id=? AND ea.status="in_progress"');$s->execute([$id]);$hasActiveAttempt=(int)$s->fetchColumn()>0;
+                    if($hasSavedAnswer||$hasActiveAttempt){flash('danger','This question has been used in a saved answer or an active exam and is locked to preserve exam history. Create a corrected replacement question instead.');header('Location: index.php?action=questions&edit='.$id);exit;}
+                    $s=$pdo->prepare('UPDATE questions SET subject_id=?,question_text=?,option_a=?,option_b=?,option_c=?,option_d=?,correct_option=?,marks=? WHERE id=?');$s->execute([$subject,$text,$a,$b,$c,$d,$correct,$marks,$id]);audit($pdo,'question_updated','question',(string)$id);flash('success','Question updated.');
+                }else{$s=$pdo->prepare('INSERT INTO questions(subject_id,question_text,option_a,option_b,option_c,option_d,correct_option,marks,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,NOW())');$s->execute([$subject,$text,$a,$b,$c,$d,$correct,$marks,current_user()['id']]);audit($pdo,'question_created','question',(string)$pdo->lastInsertId());flash('success','Question added.');}
+            }catch(Throwable $e){error_log('Cycle Exam question save error: '.$e->getMessage());flash('danger','Question could not be saved. Review the subject and question details.');}
+        }
+        redirect('questions');
+    }
+    $editId=(int)($_GET['edit']??0);$editQuestion=null;$editQuestionUsed=false;if($editId){$s=$pdo->prepare('SELECT * FROM questions WHERE id=?');$s->execute([$editId]);$editQuestion=$s->fetch()?:null;if($editQuestion){$s=$pdo->prepare('SELECT COUNT(*) FROM attempt_answers WHERE question_id=?');$s->execute([$editId]);$editQuestionUsed=(int)$s->fetchColumn()>0;if(!$editQuestionUsed){$s=$pdo->prepare('SELECT COUNT(*) FROM exam_attempts ea JOIN exams e ON e.id=ea.exam_id JOIN questions q ON q.subject_id=e.subject_id WHERE q.id=? AND ea.status="in_progress"');$s->execute([$editId]);$editQuestionUsed=(int)$s->fetchColumn()>0;}}}
+    if($editId&&!$editQuestion)echo '<div class="alert alert-danger">Question not found.</div>';
+    $subjects=$pdo->query('SELECT id,subject_name FROM subjects WHERE is_active=1 ORDER BY subject_name')->fetchAll();
+    echo '<div class="card"><h2>'.($editQuestion?'Edit MCQ question':'Add MCQ question').'</h2>';if($editQuestionUsed)echo '<div class="alert alert-warning">This question is already in an exam attempt and cannot be edited, to preserve exam history.</div>';else{echo '<form method="post">';csrf_input();if($editQuestion)echo '<input type="hidden" name="question_id" value="'.(int)$editQuestion['id'].'">';echo '<label class="field"><span>Subject</span><select name="subject_id" required><option value="">Select subject</option>';foreach($subjects as $s)echo '<option value="'.(int)$s['id'].'"'.((int)($editQuestion['subject_id']??0)===(int)$s['id']?' selected':'').'>'.e($s['subject_name']).'</option>';echo '</select></label>';echo '<label class="field"><span>Question text</span><textarea name="question_text" required rows="3">'.e($editQuestion['question_text']??'').'</textarea></label><div class="form-grid">';foreach(['a'=>'Option A','b'=>'Option B','c'=>'Option C','d'=>'Option D'] as $k=>$v)post_field('option_'.$k,$v,'text',(string)($editQuestion['option_'.$k]??''),true);echo '</div><div class="form-grid"><label class="field"><span>Correct option</span><select name="correct_option" required>';foreach(['A','B','C','D'] as $option)echo '<option'.(($editQuestion['correct_option']??'A')===$option?' selected':'').'>'.$option.'</option>';echo '</select></label>';post_field('marks','Marks','number',(string)($editQuestion['marks']??'1.00'),true,'min="0.01" step="0.01"');echo '</div><div class="form-actions"><button class="btn btn-primary">'.($editQuestion?'Save question':'Add question').'</button>'.($editQuestion?'<a class="btn btn-light" href="index.php?action=questions">Cancel</a>':'').'</div></form>';}echo '</div>';
+    $q=$pdo->query('SELECT q.id,q.question_text,q.marks,s.subject_name FROM questions q JOIN subjects s ON s.id=q.subject_id ORDER BY q.id DESC LIMIT 100')->fetchAll();echo '<div class="card"><h2>Question bank</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>Subject</th><th>Question</th><th>Marks</th>';if($canManageQuestions)echo '<th>Action</th>';echo '</tr></thead><tbody>';foreach($q as $r){echo '<tr><td>'.(int)$r['id'].'</td><td>'.e($r['subject_name']).'</td><td>'.e($r['question_text']).'</td><td>'.e($r['marks']).'</td>';if($canManageQuestions)echo '<td><a class="btn btn-light btn-sm" href="index.php?action=questions&edit='.(int)$r['id'].'">Edit</a></td>';echo '</tr>';}if(!$q)echo '<tr><td colspan="'.($canManageQuestions?5:4).'">No questions yet.</td></tr>';echo '</tbody></table></div></div>';
+    break;
+
+case 'exams':
+    require_role(['super_admin','exam_admin','teacher','student']);
+    if(current_user()['role']!=='student' && $_SERVER['REQUEST_METHOD']==='POST'){
+        require_role(['super_admin','exam_admin']);
+        $title=trim((string)($_POST['title']??''));$subject=(int)($_POST['subject_id']??0);$start=str_replace('T',' ',(string)($_POST['start_at']??''));$end=str_replace('T',' ',(string)($_POST['end_at']??''));$duration=(int)($_POST['duration_minutes']??0);$marks=(float)($_POST['total_marks']??0);$pass=(float)($_POST['pass_marks']??0);$dept=(int)($_POST['department_id']??0);$year=trim((string)($_POST['year_level']??''));$status=(string)($_POST['status']??'scheduled');$examId=(int)($_POST['exam_id']??0);
+        if(!in_array($status,['draft','scheduled','active','closed'],true)){$status='invalid';}
+        if($examId>0){
+            $pdo->beginTransaction();
+            try{
+                $s=$pdo->prepare('SELECT id FROM exams WHERE id=? AND is_archived=0 FOR UPDATE');$s->execute([$examId]);$existing=$s->fetchColumn();
+                if(!$existing){$pdo->rollBack();flash('danger','Examination not found.');redirect('exams');}
+                $s=$pdo->prepare('SELECT COUNT(*) FROM exam_attempts WHERE exam_id=?');$s->execute([$examId]);$hasAttempts=(int)$s->fetchColumn()>0;
+                if($hasAttempts){
+                    if(!in_array($status,['active','closed'],true)){flash('danger','After an attempt exists, the status can only be Active or Closed.');}
+                    else{$pdo->prepare('UPDATE exams SET status=? WHERE id=?')->execute([$status,$examId]);audit($pdo,'exam_status_updated','exam',(string)$examId,['status'=>$status]);flash('success','Examination status updated. Schedule details stay locked after an attempt exists.');}
+                }elseif(!$title||!$subject||!$start||!$end||$duration<1||$marks<=0||$pass<0||$pass>$marks||strtotime($end)<=strtotime($start)||$status==='invalid'){
+                    flash('danger','Check title, subject, dates, duration, marks and status.');
+                }else{
+                    $s=$pdo->prepare('SELECT id FROM subjects WHERE id=? AND is_active=1');$s->execute([$subject]);
+                    if(!$s->fetchColumn()){flash('danger','Choose an active subject.');}
+                    else{$s=$pdo->prepare('UPDATE exams SET title=?,subject_id=?,start_at=?,end_at=?,duration_minutes=?,total_marks=?,pass_marks=?,department_id=?,year_level=?,status=? WHERE id=? AND is_archived=0');$s->execute([$title,$subject,date('Y-m-d H:i:s',strtotime($start)),date('Y-m-d H:i:s',strtotime($end)),$duration,$marks,$pass,$dept?:null,$year?:null,$status,$examId]);audit($pdo,'exam_updated','exam',(string)$examId);flash('success','Examination schedule updated.');}
+                }
+                $pdo->commit();
+            }catch(Throwable $e){if($pdo->inTransaction())$pdo->rollBack();error_log('Cycle Exam schedule update error: '.$e->getMessage());flash('danger','Examination could not be updated. Please review the schedule and try again.');}
+            redirect('exams');
+        }
+        if(!$title||!$subject||!$start||!$end||$duration<1||$marks<=0||$pass<0||$pass>$marks||strtotime($end)<=strtotime($start)||$status==='invalid'){
+            flash('danger','Check title, subject, dates, duration, marks and status.');
+        }else{$s=$pdo->prepare('SELECT id FROM subjects WHERE id=? AND is_active=1');$s->execute([$subject]);if(!$s->fetchColumn()){flash('danger','Choose an active subject.');}else{$s=$pdo->prepare('INSERT INTO exams(title,subject_id,start_at,end_at,duration_minutes,total_marks,pass_marks,department_id,year_level,status,is_archived,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,0,?,NOW())');$s->execute([$title,$subject,date('Y-m-d H:i:s',strtotime($start)),date('Y-m-d H:i:s',strtotime($end)),$duration,$marks,$pass,$dept?:null,$year?:null,$status,current_user()['id']]);audit($pdo,'exam_created','exam',(string)$pdo->lastInsertId());flash('success','Exam created and scheduled.');}}
+        redirect('exams');
+    }
+    if(in_array(current_user()['role'],['super_admin','exam_admin'],true)){
+        $subjects=$pdo->query('SELECT id,subject_name FROM subjects WHERE is_active=1 ORDER BY subject_name')->fetchAll();$depts=$pdo->query('SELECT id,department_name FROM departments ORDER BY department_name')->fetchAll();$editId=(int)($_GET['edit']??0);$edit=null;$attemptCount=0;
+        if($editId>0){$s=$pdo->prepare('SELECT * FROM exams WHERE id=? AND is_archived=0');$s->execute([$editId]);$edit=$s->fetch();if($edit){$s=$pdo->prepare('SELECT COUNT(*) FROM exam_attempts WHERE exam_id=?');$s->execute([$editId]);$attemptCount=(int)$s->fetchColumn();}}
+        if($editId>0&&!$edit)echo '<div class="alert alert-danger">Examination not found.</div>';
+        $formTitle=$edit?'Edit examination schedule':'Create monthly cycle test';echo '<div class="card"><h2>'.e($formTitle).'</h2>';
+        if($edit&&$attemptCount>0)echo '<div class="alert alert-warning">Students have started this exam. Schedule details are locked to protect their attempts. You can still change the status.</div>';
+        echo '<form method="post">';csrf_input();if($edit)echo '<input type="hidden" name="exam_id" value="'.(int)$edit['id'].'">';
+        if(!$edit||$attemptCount===0){
+            post_field('title','Exam title (e.g. October Cycle Test)','text',(string)($edit['title']??''),true);echo '<label class="field"><span>Subject</span><select name="subject_id" required><option value="">Choose subject</option>';foreach($subjects as $subj)echo '<option value="'.(int)$subj['id'].'"'.((int)($edit['subject_id']??0)===(int)$subj['id']?' selected':'').'>'.e($subj['subject_name']).'</option>';echo '</select></label><div class="form-grid">';
+            post_field('start_at','Start date/time','datetime-local',$edit?date('Y-m-d\\TH:i',strtotime($edit['start_at'])):'',true);post_field('end_at','End date/time','datetime-local',$edit?date('Y-m-d\\TH:i',strtotime($edit['end_at'])):'',true);post_field('duration_minutes','Duration (minutes)','number',(string)($edit['duration_minutes']??30),true,'min="1"');post_field('total_marks','Total marks','number',(string)($edit['total_marks']??20),true,'min="0.01" step="0.01"');post_field('pass_marks','Pass marks','number',(string)($edit['pass_marks']??10),true,'min="0" step="0.01"');echo '<label class="field"><span>Department (optional)</span><select name="department_id"><option value="0">All departments</option>';foreach($depts as $d)echo '<option value="'.(int)$d['id'].'"'.((int)($edit['department_id']??0)===(int)$d['id']?' selected':'').'>'.e($d['department_name']).'</option>';echo '</select></label>';post_field('year_level','Year / level (optional)','text',(string)($edit['year_level']??''));echo '</div>';
+        }else{echo '<p><b>'.e($edit['title']).'</b> · '.e($edit['start_at']).' to '.e($edit['end_at']).' · '.(int)$edit['duration_minutes'].' minutes</p>';}
+        echo '<label class="field"><span>Exam status</span><select name="status">';$allowedStatuses=$attemptCount>0?['active'=>'Active','closed'=>'Closed']:['draft'=>'Draft','scheduled'=>'Scheduled','active'=>'Active','closed'=>'Closed'];foreach($allowedStatuses as $value=>$label)echo '<option value="'.$value.'"'.(($edit['status']??'scheduled')===$value?' selected':'').'>'.$label.'</option>';echo '</select></label><div class="form-actions"><button class="btn btn-primary">'.($edit?'Save examination':'Create exam').'</button>'.($edit?'<a class="btn btn-light" href="index.php?action=exams">Cancel</a>':'').'</div></form>';
+        if(!$edit)echo '<p class="muted small">Question-to-exam assignment and randomization are not included; exams currently use the subject question bank.</p>';echo '</div>';
+    }
+    $canManageExams=in_array(current_user()['role'],['super_admin','exam_admin'],true);
+    if(current_user()['role']==='student'){$s=$pdo->prepare("SELECT e.*,s.subject_name FROM exams e JOIN subjects s ON s.id=e.subject_id LEFT JOIN student_profiles sp ON sp.user_id=? WHERE e.is_archived=0 AND e.status IN ('scheduled','active','closed','evaluated','published') AND (e.department_id IS NULL OR e.department_id=sp.department_id) AND (e.year_level IS NULL OR e.year_level=sp.year_level) ORDER BY e.start_at DESC LIMIT 100");$s->execute([current_user()['id']]);$rows=$s->fetchAll();}
+    else{$rows=$pdo->query('SELECT e.*,s.subject_name FROM exams e JOIN subjects s ON s.id=e.subject_id WHERE e.is_archived=0 ORDER BY e.start_at DESC LIMIT 100')->fetchAll();}
+    echo '<div class="card"><h2>Examination schedule</h2>';if(current_user()['role']==='student')echo '<p class="muted">Use Take exam during the scheduled window. If an attempt is already in progress, resume it here or from Dashboard.</p>';echo '<div class="table-wrap"><table><thead><tr><th>Exam</th><th>Subject</th><th>Start</th><th>End</th><th>Duration</th><th>Status</th>';if($canManageExams||current_user()['role']==='student')echo '<th>Action</th>';echo '</tr></thead><tbody>';
+    foreach($rows as $r){echo '<tr><td>'.e($r['title']).'</td><td>'.e($r['subject_name']).'</td><td>'.e($r['start_at']).'</td><td>'.e($r['end_at']).'</td><td>'.(int)$r['duration_minutes'].' min</td>';
+        if(current_user()['role']==='student'){$a=$pdo->prepare('SELECT id,status,started_at FROM exam_attempts WHERE exam_id=? AND student_user_id=? LIMIT 1');$a->execute([$r['id'],current_user()['id']]);$attempt=$a->fetch()?:null;$access=student_exam_access($r,$attempt);echo '<td><span class="pill">'.e($access['label']).'</span></td><td>'.($access['action']?'<a class="btn btn-primary btn-sm" href="index.php?action=take_exam&id='.(int)$r['id'].'">'.e($access['action']).'</a>':'—').'</td>';}
+        else{echo '<td><span class="pill">'.e($r['status']).'</span></td>';if($canManageExams)echo '<td><a class="btn btn-light btn-sm" href="index.php?action=exams&edit='.(int)$r['id'].'">Edit / status</a></td>';}
+        echo '</tr>';}
+    if(!$rows)echo '<tr><td colspan="'.(($canManageExams||current_user()['role']==='student')?7:6).'">No examinations scheduled for your account.</td></tr>';echo '</tbody></table></div></div>';
+    break;
+
+case 'take_exam':
+    require_role(['student']);
+    $examId=(int)($_GET['id']??$_POST['exam_id']??0);$studentId=(int)current_user()['id'];
+    $s=$pdo->prepare("SELECT e.*,su.subject_name FROM exams e JOIN subjects su ON su.id=e.subject_id LEFT JOIN student_profiles sp ON sp.user_id=? WHERE e.id=? AND e.is_archived=0 AND (e.department_id IS NULL OR e.department_id=sp.department_id) AND (e.year_level IS NULL OR e.year_level=sp.year_level)");$s->execute([$studentId,$examId]);$exam=$s->fetch();if(!$exam){echo '<div class="card">Exam not found or you are not eligible.</div>';break;}
+    $s=$pdo->prepare("SELECT * FROM exam_attempts WHERE exam_id=? AND student_user_id=? LIMIT 1");$s->execute([$examId,$studentId]);$attempt=$s->fetch();
+    if($_SERVER['REQUEST_METHOD']==='POST'){
+        $attemptId=(int)($_POST['attempt_id']??0);$sub=$pdo->prepare("SELECT * FROM exam_attempts WHERE id=? AND exam_id=? AND student_user_id=? AND status='in_progress'");$sub->execute([$attemptId,$examId,$studentId]);$postedAttempt=$sub->fetch();
+        if(!$postedAttempt){flash('danger','This attempt is no longer active.');redirect('dashboard');}
+        $answers=$_POST['answers']??[];$flags=$_POST['flags']??[];if(!is_array($answers))$answers=[];if(!is_array($flags))$flags=[];
+        $deadline=min(strtotime($postedAttempt['started_at'])+(int)$exam['duration_minutes']*60,strtotime($exam['end_at']));
+        $expired=$exam['status']!=='active'||time()>=$deadline;
+        try{finalize_exam_attempt($pdo,$examId,$studentId,$postedAttempt,$exam,$answers,$flags,$expired);flash('success',$expired?'Your saved answers were submitted. Results will appear after the examination administrator publishes them.':'Your examination was submitted. Results will appear after the examination administrator publishes them.');redirect('dashboard');}
+        catch(Throwable $e){error_log('Cycle Exam submission error: '.$e->getMessage());flash('danger','Submission could not be completed. Your saved answers are still available; please retry.');header('Location: index.php?action=take_exam&id='.$examId);exit;}
+    }
+    if($attempt&&$attempt['status']!=='in_progress'){echo '<div class="card"><h2>Attempt submitted</h2><p>Your attempt has already been submitted. A second attempt is not allowed for this examination.</p></div>';break;}
+    if($attempt){
+        $attemptDeadline=min(strtotime($attempt['started_at'])+(int)$exam['duration_minutes']*60,strtotime($exam['end_at']));
+        if($exam['status']!=='active'||time()>=$attemptDeadline){
+            try{finalize_exam_attempt($pdo,$examId,$studentId,$attempt,$exam,[],[],true);flash('warning','Your saved answers were submitted because the exam ended or was closed. Your attempt was not lost.');redirect('dashboard');}
+            catch(Throwable $e){error_log('Cycle Exam expired attempt finalization error: '.$e->getMessage());echo '<div class="alert alert-danger">Your saved attempt could not be submitted yet. Please retry when your connection is available.</div>';break;}
+        }
+    }elseif($exam['status']!=='active'||strtotime($exam['start_at'])>time()||strtotime($exam['end_at'])<time()){
+        echo '<div class="card">This examination is not currently open.</div>';break;
+    }
+    if(!$attempt){$pdo->prepare("INSERT INTO exam_attempts(exam_id,student_user_id,status,started_at) VALUES(?,?,'in_progress',NOW())")->execute([$examId,$studentId]);$attemptId=(int)$pdo->lastInsertId();$attempt=['id'=>$attemptId,'started_at'=>date('Y-m-d H:i:s')];}else $attemptId=(int)$attempt['id'];
+    $deadline=min(strtotime($attempt['started_at'])+(int)$exam['duration_minutes']*60,strtotime($exam['end_at']));
+    $q=$pdo->prepare('SELECT id,question_text,option_a,option_b,option_c,option_d,marks FROM questions WHERE subject_id=? ORDER BY id');$q->execute([$exam['subject_id']]);$questions=$q->fetchAll();
+    $saved=$pdo->prepare('SELECT question_id,selected_option,is_flagged FROM attempt_answers WHERE attempt_id=?');$saved->execute([$attemptId]);$answers=[];$flags=[];foreach($saved->fetchAll() as $a){$qid=(int)$a['question_id'];$answers[$qid]=$a['selected_option'];$flags[$qid]=(int)$a['is_flagged']===1;}
+    if(!$questions){echo '<div class="card"><h2>No questions available</h2><p>Contact your examination administrator. The attempt has been created but cannot be completed until questions are configured.</p></div>';break;}
+    echo '<div class="exam-top card"><div><h2>'.e($exam['title']).'</h2><p>'.e($exam['subject_name']).' · <span id="exam-progress">0 of '.count($questions).' answered</span></p></div><div class="timer" id="exam-timer" data-deadline="'.(int)$deadline.'">--:--</div></div><div id="exam-connectivity" class="alert alert-success exam-connectivity" role="status"><span id="exam-connection-text">Connected — answers save automatically.</span><button class="btn btn-light btn-sm" type="button" id="exam-fullscreen">Optional fullscreen</button></div><div id="exam-focus-warning" class="alert alert-warning exam-focus-warning" role="status" hidden></div><p class="muted small">If your connection drops, keep this page open and reconnect. This web exam can warn when you switch apps, but cannot lock your phone or prevent tab switching.</p><form method="post" id="exam-form" class="exam-form" data-attempt-id="'.$attemptId.'">';csrf_input();echo '<input type="hidden" name="exam_id" value="'.$examId.'"><input type="hidden" name="attempt_id" value="'.$attemptId.'"><div class="exam-layout"><div class="exam-questions">';
+    foreach($questions as $i=>$q){$qid=(int)$q['id'];echo '<section class="card question-card" data-question-index="'.$i.'"><div class="question-number">QUESTION '.($i+1).' · '.e($q['marks']).' mark(s)</div><h3>'.e($q['question_text']).'</h3>';foreach(['A'=>'option_a','B'=>'option_b','C'=>'option_c','D'=>'option_d'] as $letter=>$col)echo '<label class="option"><input type="radio" name="answers['.$qid.']" value="'.$letter.'" data-question-id="'.$qid.'" '.(($answers[$qid]??'')===$letter?'checked':'').'> <span><b>'.$letter.'.</b> '.e($q[$col]).'</span></label>';echo '<input type="hidden" name="flags['.$qid.']" value="'.(!empty($flags[$qid])?'1':'0').'" data-flag-value data-question-id="'.$qid.'"><div class="question-actions"><span class="muted">Question '.($i+1).' of '.count($questions).'</span><button class="btn btn-light btn-sm" type="button" data-flag-button data-question-id="'.$qid.'" aria-pressed="'.(!empty($flags[$qid])?'true':'false').'">'.(!empty($flags[$qid])?'Unflag question':'Flag for review').'</button></div></section>';}
+    echo '</div><aside class="card question-navigation"><h2>Question navigator</h2><div class="question-nav-grid">';
+    foreach($questions as $i=>$q){$qid=(int)$q['id'];$answered=!empty($answers[$qid]);$flagged=!empty($flags[$qid]);echo '<button class="question-nav-button'.($i===0?' current':'').($answered?' answered':'').($flagged?' flagged':'').'" type="button" data-nav-index="'.$i.'" aria-label="Question '.($i+1).($answered?', answered':', unanswered').($flagged?', flagged for review':'').'">'.($i+1).'</button>';}
+    echo '</div><div class="question-legend"><span><i class="legend-dot answered-dot"></i>Answered</span><span><i class="legend-dot"></i>Unanswered</span><span><i class="legend-dot flagged-dot"></i>Flagged</span></div><p id="answer-save-status" class="save-status" role="status" aria-live="polite">Answers save automatically.</p></aside></div><div class="sticky-submit"><button class="btn btn-light" type="button" id="previous-question">Previous</button><span class="muted">Review unanswered questions before submitting.</span><div class="form-actions"><button class="btn btn-light" type="button" id="next-question">Next</button><button class="btn btn-primary" type="submit">Submit exam</button></div></div></form>';
+    break;
+
+case 'results':
+    require_role(['super_admin','exam_admin','teacher','student']);
+    if(current_user()['role']!=='student' && $_SERVER['REQUEST_METHOD']==='POST'){require_role(['super_admin','exam_admin']);$id=(int)($_POST['result_id']??0);$s=$pdo->prepare('UPDATE results SET is_published=1,published_at=NOW() WHERE id=?');$s->execute([$id]);audit($pdo,'result_published','result',(string)$id);flash('success','Result published to the student.');redirect('results');}
+    if(current_user()['role']==='student'){$s=$pdo->prepare("SELECT r.*,e.title,u.display_name,u.login_id FROM results r JOIN exams e ON e.id=r.exam_id JOIN users u ON u.id=r.student_user_id WHERE r.student_user_id=? AND r.is_published=1 ORDER BY r.published_at DESC");$s->execute([current_user()['id']]);$rows=$s->fetchAll();}
+    else {$rows=$pdo->query("SELECT r.*,e.title,u.display_name,u.login_id FROM results r JOIN exams e ON e.id=r.exam_id JOIN users u ON u.id=r.student_user_id ORDER BY r.created_at DESC LIMIT 300")->fetchAll();}
+    echo '<div class="card"><h2>'.(current_user()['role']==='student'?'Your published results':'Exam results · latest 300').'</h2><div class="table-wrap"><table><thead><tr><th>Exam</th><th>Student</th><th>Register no.</th><th>Marks</th><th>Percentage</th><th>Status</th><th></th></tr></thead><tbody>';foreach($rows as $r){$published=(int)$r['is_published'];echo '<tr><td>'.e($r['title']).'</td><td>'.e($r['display_name']).'</td><td>'.e($r['login_id']).'</td><td>'.e($r['marks_obtained']).' / '.e($r['max_marks']).'</td><td>'.number_format((float)$r['percentage'],2).'%</td><td>'.($published?'Published':'Pending').'</td><td>'.(!$published&&current_user()['role']!=='student'?'<form method="post">':'');if(!$published&&current_user()['role']!=='student'){csrf_input();echo '<input type="hidden" name="result_id" value="'.(int)$r['id'].'"><button class="btn btn-primary btn-sm">Publish</button></form>';}echo '</td></tr>';}if(!$rows)echo '<tr><td colspan="7">No results found.</td></tr>';echo '</tbody></table></div></div>';
+    break;
+
+case 'settings':
+    require_role(['super_admin']);
+    if($_SERVER['REQUEST_METHOD']==='POST'){
+        $allowed=['institution_name','portal_description','primary_color','accent_color','footer_text','contact_email','privacy_policy','exam_rules'];$updates=[];
+        foreach($allowed as $key){$val=trim((string)($_POST[$key]??''));if(in_array($key,['primary_color','accent_color'],true)&&!preg_match('/^#[0-9a-fA-F]{6}$/',$val)){flash('danger','Colors must be valid six-digit hex values.');redirect('settings');}$updates[$key]=$val;}
+        foreach($updates as $key=>$val){$s=$pdo->prepare('INSERT INTO settings(setting_key,setting_value,updated_at) VALUES(?,?,NOW()) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value),updated_at=NOW()');$s->execute([$key,$val]);}
+        if(!empty($_FILES['logo']['tmp_name'])&&($_FILES['logo']['error']??1)===UPLOAD_ERR_OK){$size=(int)$_FILES['logo']['size'];$mime=(new finfo(FILEINFO_MIME_TYPE))->file($_FILES['logo']['tmp_name']);$ext=['image/png'=>'png','image/jpeg'=>'jpg','image/webp'=>'webp'][$mime]??null;if($size<2*1024*1024&&$ext){$dir=__DIR__.'/uploads';if(!is_dir($dir))mkdir($dir,0750,true);$name='logo_'.bin2hex(random_bytes(8)).'.'.$ext;if(move_uploaded_file($_FILES['logo']['tmp_name'],$dir.'/'.$name)){$path='uploads/'.$name;$s=$pdo->prepare('INSERT INTO settings(setting_key,setting_value,updated_at) VALUES(?,?,NOW()) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value),updated_at=NOW()');$s->execute(['logo_path',$path]);}}else{flash('warning','Settings saved, but logo upload was rejected. Use PNG/JPEG/WebP under 2 MB.');}}
+        audit($pdo,'settings_updated','settings');flash('success','Settings saved.');redirect('settings');
+    }
+    echo '<div class="card"><h2>Institution branding</h2><p class="muted">Changes apply across the login page and portal. Current brand palette uses aviation red (#E31825) and gold (#FFC20E). Logo upload accepts PNG, JPEG or WebP up to 2 MB.</p><form method="post" enctype="multipart/form-data">';csrf_input();post_field('institution_name','Institution name','text',setting($pdo,'institution_name',$config['app_name']),true);post_field('portal_description','Portal description','text',setting($pdo,'portal_description','Monthly cycle test examination portal'));echo '<div class="form-grid">';post_field('primary_color','Primary color','color',setting($pdo,'primary_color','#e31825'),true);post_field('accent_color','Accent color','color',setting($pdo,'accent_color','#ffc20e'),true);post_field('contact_email','Contact email','email',setting($pdo,'contact_email',''));echo '</div>';post_field('footer_text','Footer text','text',setting($pdo,'footer_text',''));echo '<label class="field"><span>College logo</span><input type="file" name="logo" accept="image/png,image/jpeg,image/webp"></label>';echo '<label class="field"><span>Privacy policy (plain text)</span><textarea name="privacy_policy" rows="5">'.e(setting($pdo,'privacy_policy','This portal uses student information only for authorized academic examination purposes. Contact the institution for questions about data handling.')).'</textarea></label><label class="field"><span>Examination rules</span><textarea name="exam_rules" rows="5">'.e(setting($pdo,'exam_rules','Use your own login. Read each question carefully. Do not refresh repeatedly or close the browser during an exam. Submit before the timer expires. Contact the examination office if a technical issue occurs.')).'</textarea></label><button class="btn btn-primary">Save settings</button></form></div>';
+    break;
+
+case 'policies':
+case 'public_policies':
+    echo '<div class="card"><h2>Privacy policy</h2><div class="policy-text">'.nl2br(e(setting($pdo,'privacy_policy','This portal uses student information only for authorized academic examination purposes. Contact the institution for questions about data handling.'))).'</div><p class="muted small">Template text — institution administrators should review and approve before deployment.</p></div><div class="card"><h2>Examination rules</h2><div class="policy-text">'.nl2br(e(setting($pdo,'exam_rules','Use your own login. Read each question carefully. Do not refresh repeatedly or close the browser during an exam. Submit before the timer expires. Contact the examination office if a technical issue occurs.'))).'</div></div>';
+    break;
+
+case 'audit':
+    require_role(['super_admin']);
+    $rows=$pdo->query('SELECT a.*,u.display_name FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_user_id ORDER BY a.id DESC LIMIT 200')->fetchAll();echo '<div class="card"><h2>Recent security and admin events</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>IP</th></tr></thead><tbody>';foreach($rows as $r)echo '<tr><td>'.e($r['created_at']).'</td><td>'.e($r['display_name']??'System/Unknown').'</td><td>'.e($r['action']).'</td><td>'.e($r['target_type'].' '.$r['target_id']).'</td><td>'.e($r['ip_address']).'</td></tr>';if(!$rows)echo '<tr><td colspan="5">No events recorded yet.</td></tr>';echo '</tbody></table></div></div>';
+    break;
+
+default:
+    echo '<div class="card"><h2>Page not found</h2><p>The requested page does not exist.</p><a class="btn btn-primary" href="index.php?action=dashboard">Return to dashboard</a></div>';
+}
+page_end();
