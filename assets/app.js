@@ -49,6 +49,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const next = document.getElementById('next-question');
     let current = 0;
     let saveQueue = Promise.resolve();
+    const answerSaveTimers = new Map();
     const csrf = form.querySelector('input[name="csrf"]')?.value || '';
     const examId = form.querySelector('input[name="exam_id"]')?.value || '';
     const attemptId = form.querySelector('input[name="attempt_id"]')?.value || '';
@@ -70,11 +71,13 @@ document.addEventListener('DOMContentLoaded', () => {
       pendingDrafts = {};
     }
 
-    const selectedAnswer = (questionId) => form.querySelector(`input[data-question-id="${questionId}"]:checked`)?.value || '';
+    const selectedAnswer = (questionId) => form.querySelector(`textarea[data-question-id="${questionId}"]`)?.value ?? form.querySelector(`input[data-question-id="${questionId}"]:checked`)?.value ?? '';
     const isFlagged = (questionId) => form.querySelector(`[data-flag-button][data-question-id="${questionId}"]`)?.getAttribute('aria-pressed') === 'true';
     const restorePendingDrafts = () => {
       Object.entries(pendingDrafts).forEach(([questionId, draft]) => {
-        if (!/^\d+$/.test(questionId) || !draft || !['A', 'B', 'C', 'D', ''].includes(draft.answer) || !['0', '1'].includes(draft.flagged)) return;
+        if (!/^[md]?\d+$/.test(questionId) || !draft || typeof draft.answer !== 'string' || draft.answer.length > 60000 || !['0', '1'].includes(draft.flagged)) return;
+        const textarea = form.querySelector(`textarea[data-question-id="${questionId}"]`);
+        if (textarea) textarea.value = draft.answer;
         const radio = draft.answer && form.querySelector(`input[data-question-id="${questionId}"][value="${draft.answer}"]`);
         if (radio) radio.checked = true;
         const button = form.querySelector(`[data-flag-button][data-question-id="${questionId}"]`);
@@ -166,6 +169,18 @@ document.addEventListener('DOMContentLoaded', () => {
       updateNavigation();
       saveQuestion(input.dataset.questionId);
     }));
+    form.querySelectorAll('textarea[data-question-id]').forEach((textarea) => {
+      const saveSoon = () => {
+        updateNavigation();
+        window.clearTimeout(answerSaveTimers.get(textarea.dataset.questionId));
+        answerSaveTimers.set(textarea.dataset.questionId, window.setTimeout(() => saveQuestion(textarea.dataset.questionId), 800));
+      };
+      textarea.addEventListener('input', saveSoon);
+      textarea.addEventListener('blur', () => {
+        window.clearTimeout(answerSaveTimers.get(textarea.dataset.questionId));
+        saveQuestion(textarea.dataset.questionId);
+      });
+    });
     form.querySelectorAll('[data-flag-button]').forEach((button) => button.addEventListener('click', () => {
       const flagged = button.getAttribute('aria-pressed') !== 'true';
       button.setAttribute('aria-pressed', flagged ? 'true' : 'false');

@@ -7,6 +7,7 @@ if (!is_file($configFile)) {
     exit;
 }
 $config = require $configFile;
+require_once __DIR__.'/descriptive_marking.php';
 date_default_timezone_set($config['timezone'] ?? 'Asia/Kolkata');
 $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off');
 session_name('cycle_exam_session');
@@ -96,7 +97,7 @@ $action = (string)($_GET['action'] ?? (current_user() ? 'dashboard' : 'login'));
 $publicActions = ['login','logout','public_policies'];
 if (!in_array($action, $publicActions, true)) require_login();
 if (current_user() && !empty(current_user()['must_change_password']) && !in_array($action, ['change_password','logout'], true)) redirect('change_password');
-if (current_user() && current_user()['role']==='teacher' && !in_array($action,['subjects','questions','profile','change_password','logout'],true)) redirect('subjects');
+if (current_user() && current_user()['role']==='teacher' && !in_array($action,['subjects','questions','descriptive_questions','descriptive_review','profile','change_password','logout'],true)) redirect('subjects');
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') verify_csrf();
 
@@ -148,22 +149,31 @@ if ($action === 'save_answer') {
         exit;
     }
 
-    $examId=(int)($_POST['exam_id']??0);$attemptId=(int)($_POST['attempt_id']??0);$questionId=(int)($_POST['question_id']??0);
-    $rawChoice=$_POST['answer']??'';$choice=is_string($rawChoice)?strtoupper(trim($rawChoice)):'invalid';$flagged=$_POST['flagged']??'0';
-    if($examId<1||$attemptId<1||$questionId<1||!in_array($choice,['','A','B','C','D'],true)||!in_array($flagged,['0','1'],true)){
+    $examId=(int)($_POST['exam_id']??0);$attemptId=(int)($_POST['attempt_id']??0);$questionKey=(string)($_POST['question_id']??'');$questionType='mcq';if(preg_match('/^([md])?(\d+)$/',$questionKey,$questionMatch)){$questionType=($questionMatch[1]??'')==='d'?'typing':'mcq';$questionId=(int)$questionMatch[2];}else $questionId=0;
+    $rawAnswer=$_POST['answer']??'';$answer=is_string($rawAnswer)?$rawAnswer:'invalid';$flagged=$_POST['flagged']??'0';
+    if($examId<1||$attemptId<1||$questionId<1||$answer==='invalid'||strlen($answer)>60000||!in_array($flagged,['0','1'],true)){
         http_response_code(422);echo json_encode(['saved'=>false,'message'=>'Invalid answer data.']);exit;
     }
 
     try{
-        $s=$pdo->prepare("SELECT e.subject_id,e.status,e.start_at,e.end_at,e.duration_minutes,a.started_at FROM exam_attempts a JOIN exams e ON e.id=a.exam_id LEFT JOIN student_profiles sp ON sp.user_id=a.student_user_id WHERE a.id=? AND a.exam_id=? AND a.student_user_id=? AND a.status='in_progress' AND e.is_archived=0 AND (e.department_id IS NULL OR e.department_id=sp.department_id) AND (e.year_level IS NULL OR e.year_level=sp.year_level)");
+        $s=$pdo->prepare("SELECT e.subject_id,e.exam_pattern,e.status,e.start_at,e.end_at,e.duration_minutes,a.started_at FROM exam_attempts a JOIN exams e ON e.id=a.exam_id LEFT JOIN student_profiles sp ON sp.user_id=a.student_user_id WHERE a.id=? AND a.exam_id=? AND a.student_user_id=? AND a.status='in_progress' AND e.is_archived=0 AND (e.department_id IS NULL OR e.department_id=sp.department_id) AND (e.year_level IS NULL OR e.year_level=sp.year_level)");
         $s->execute([$attemptId,$examId,current_user()['id']]);$attempt=$s->fetch();
         if(!$attempt||$attempt['status']!=='active'||strtotime($attempt['start_at'])>time()||strtotime($attempt['end_at'])<time()||time()>min(strtotime($attempt['started_at'])+(int)$attempt['duration_minutes']*60,strtotime($attempt['end_at']))){
             http_response_code(409);echo json_encode(['saved'=>false,'message'=>'This exam attempt is no longer open.']);exit;
         }
-        $s=$pdo->prepare('SELECT 1 FROM questions WHERE id=? AND subject_id=?');$s->execute([$questionId,$attempt['subject_id']]);
-        if(!$s->fetchColumn()){http_response_code(422);echo json_encode(['saved'=>false,'message'=>'Question does not belong to this exam.']);exit;}
-        $s=$pdo->prepare('INSERT INTO attempt_answers(attempt_id,question_id,selected_option,is_correct,marks_awarded,is_flagged,saved_at) VALUES(?,?,?,NULL,0,?,NOW()) ON DUPLICATE KEY UPDATE selected_option=VALUES(selected_option),is_flagged=VALUES(is_flagged),saved_at=NOW()');
-        $s->execute([$attemptId,$questionId,$choice?:null,(int)$flagged]);
+        if($questionType==='typing'&&in_array($attempt['exam_pattern'],['typing','mixed'],true)){
+            $s=$pdo->prepare('SELECT 1 FROM descriptive_questions WHERE id=? AND exam_id=?');$s->execute([$questionId,$examId]);
+            if(!$s->fetchColumn()){http_response_code(422);echo json_encode(['saved'=>false,'message'=>'Question does not belong to this exam.']);exit;}
+            $s=$pdo->prepare('INSERT INTO descriptive_answers(attempt_id,descriptive_question_id,answer_text,marking_status,saved_at) VALUES(?,?,?,\'pending_review\',NOW()) ON DUPLICATE KEY UPDATE answer_text=VALUES(answer_text),saved_at=NOW()');
+            $s->execute([$attemptId,$questionId,$answer]);
+        }elseif($questionType==='mcq'&&in_array($attempt['exam_pattern'],['mcq','mixed'],true)){
+            $choice=strtoupper(trim($answer));
+            if(!in_array($choice,['','A','B','C','D'],true)){http_response_code(422);echo json_encode(['saved'=>false,'message'=>'Invalid multiple-choice answer.']);exit;}
+            $s=$pdo->prepare('SELECT 1 FROM questions WHERE id=? AND subject_id=?');$s->execute([$questionId,$attempt['subject_id']]);
+            if(!$s->fetchColumn()){http_response_code(422);echo json_encode(['saved'=>false,'message'=>'Question does not belong to this exam.']);exit;}
+            $s=$pdo->prepare('INSERT INTO attempt_answers(attempt_id,question_id,selected_option,is_correct,marks_awarded,is_flagged,saved_at) VALUES(?,?,?,NULL,0,?,NOW()) ON DUPLICATE KEY UPDATE selected_option=VALUES(selected_option),is_flagged=VALUES(is_flagged),saved_at=NOW()');
+            $s->execute([$attemptId,$questionId,$choice?:null,(int)$flagged]);
+        }else{http_response_code(422);echo json_encode(['saved'=>false,'message'=>'Question type does not belong to this exam.']);exit;}
         echo json_encode(['saved'=>true]);
     }catch(Throwable $e){
         error_log('Cycle Exam answer autosave error: '.$e->getMessage());
@@ -190,6 +200,8 @@ function page_start(string $title, PDO $pdo, array $config): void {
             ['staff','Staff & teachers','♟',['super_admin','exam_admin']],
             ['subjects','Subjects','▤',['super_admin','exam_admin','teacher']],
             ['questions','Question bank','?',['super_admin','exam_admin','teacher']],
+            ['descriptive_questions','Typing questions','✎',['super_admin','exam_admin','teacher']],
+            ['descriptive_review','Typing review','✓',['super_admin','exam_admin','teacher']],
             ['exams','Examinations','◷',['super_admin','exam_admin','student']],
             ['results','Results & reports','▥',['super_admin','exam_admin','student']],
             ['profile','My profile','♙',['super_admin','exam_admin','teacher','student']],
@@ -209,18 +221,39 @@ function post_field(string $name, string $label, string $type='text', string $va
     echo '<label class="field"><span>'.e($label).'</span><input type="'.e($type).'" name="'.e($name).'" value="'.e($value).'" '.($required?'required':'').' '.$attrs.'></label>';
 }
 function csrf_input(): void { echo '<input type="hidden" name="csrf" value="'.e(csrf_token()).'">'; }
+function persist_exam_result(PDO $pdo, int $examId, int $studentId, int $attemptId, float $score, float $max, bool $markEvaluated=false): void {
+    $pct=$max>0?($score/$max*100):0;
+    $pdo->prepare("UPDATE exam_attempts SET ".($markEvaluated?"status='evaluated',":"")."marks_obtained=?,max_marks=? WHERE id=?")->execute([$score,$max,$attemptId]);
+    $pdo->prepare('INSERT INTO results(exam_id,student_user_id,attempt_id,marks_obtained,max_marks,percentage,is_published,created_at) VALUES(?,?,?,?,?,?,0,NOW()) ON DUPLICATE KEY UPDATE marks_obtained=VALUES(marks_obtained),max_marks=VALUES(max_marks),percentage=VALUES(percentage),is_published=0,published_at=NULL')->execute([$examId,$studentId,$attemptId,$score,$max,$pct]);
+}
+
 function finalize_exam_attempt(PDO $pdo, int $examId, int $studentId, array $attempt, array $exam, array $answers, array $flags, bool $expired): void {
     if ($expired) $answers = [];
     $pdo->beginTransaction();
     try {
-        $q=$pdo->prepare('SELECT id,correct_option,marks FROM questions WHERE subject_id=?');$q->execute([$exam['subject_id']]);$questionRows=$q->fetchAll();$map=[];foreach($questionRows as $row)$map[(int)$row['id']]=$row;
-        $savedAnswers=[];$savedFlags=[];$s=$pdo->prepare('SELECT question_id,selected_option,is_flagged FROM attempt_answers WHERE attempt_id=?');$s->execute([$attempt['id']]);foreach($s->fetchAll() as $saved){$qid=(int)$saved['question_id'];$savedAnswers[$qid]=$saved['selected_option'];$savedFlags[$qid]=(int)$saved['is_flagged'];}
-        $score=0.0;$max=0.0;
-        foreach($map as $qid=>$row){$max+=(float)$row['marks'];$submitted=$expired?($savedAnswers[$qid]??''):($answers[$qid]??'');$choice=is_string($submitted)?strtoupper($submitted):'';$choice=in_array($choice,['A','B','C','D'],true)?$choice:'';$flagInput=$flags[$qid]??($savedFlags[$qid]??0);$isFlagged=$flagInput===1||$flagInput==='1';$correct=$choice!==''&&$choice===$row['correct_option'];$awarded=$correct?(float)$row['marks']:0.0;$ins=$pdo->prepare('INSERT INTO attempt_answers(attempt_id,question_id,selected_option,is_correct,marks_awarded,is_flagged,saved_at) VALUES(?,?,?,?,?,?,NOW()) ON DUPLICATE KEY UPDATE selected_option=VALUES(selected_option),is_correct=VALUES(is_correct),marks_awarded=VALUES(marks_awarded),is_flagged=VALUES(is_flagged),saved_at=NOW()');$ins->execute([$attempt['id'],$qid,$choice?:null,$correct?1:0,$awarded,$isFlagged?1:0]);$score+=$awarded;}
-        $s=$pdo->prepare("UPDATE exam_attempts SET status='submitted',submitted_at=NOW(),marks_obtained=?,max_marks=? WHERE id=? AND exam_id=? AND student_user_id=? AND status='in_progress'");$s->execute([$score,$max,$attempt['id'],$examId,$studentId]);
+        $score=0.0;$max=0.0;$needsReview=false;
+        if (in_array($exam['exam_pattern']??'mcq',['mcq','mixed'],true)) {
+            $q=$pdo->prepare('SELECT id,correct_option,marks FROM questions WHERE subject_id=?');$q->execute([$exam['subject_id']]);$questionRows=$q->fetchAll();$map=[];foreach($questionRows as $row)$map[(int)$row['id']]=$row;
+            $savedAnswers=[];$savedFlags=[];$s=$pdo->prepare('SELECT question_id,selected_option,is_flagged FROM attempt_answers WHERE attempt_id=?');$s->execute([$attempt['id']]);foreach($s->fetchAll() as $saved){$qid=(int)$saved['question_id'];$savedAnswers[$qid]=$saved['selected_option'];$savedFlags[$qid]=(int)$saved['is_flagged'];}
+            foreach($map as $qid=>$row){$answerKey='m'.$qid;$max+=(float)$row['marks'];$submitted=$expired?($savedAnswers[$qid]??''):($answers[$answerKey]??$answers[$qid]??'');$choice=is_string($submitted)?strtoupper($submitted):'';$choice=in_array($choice,['A','B','C','D'],true)?$choice:'';$flagInput=$flags[$answerKey]??$flags[$qid]??($savedFlags[$qid]??0);$isFlagged=$flagInput===1||$flagInput==='1';$correct=$choice!==''&&$choice===$row['correct_option'];$awarded=$correct?(float)$row['marks']:0.0;$ins=$pdo->prepare('INSERT INTO attempt_answers(attempt_id,question_id,selected_option,is_correct,marks_awarded,is_flagged,saved_at) VALUES(?,?,?,?,?,?,NOW()) ON DUPLICATE KEY UPDATE selected_option=VALUES(selected_option),is_correct=VALUES(is_correct),marks_awarded=VALUES(marks_awarded),is_flagged=VALUES(is_flagged),saved_at=NOW()');$ins->execute([$attempt['id'],$qid,$choice?:null,$correct?1:0,$awarded,$isFlagged?1:0]);$score+=$awarded;}
+        }
+        if (in_array($exam['exam_pattern']??'mcq',['typing','mixed'],true)) {
+            $s=$pdo->prepare('SELECT * FROM descriptive_questions WHERE exam_id=? ORDER BY question_number,id');$s->execute([$examId]);$descriptiveQuestions=$s->fetchAll();
+            $saved=$pdo->prepare('SELECT descriptive_question_id,answer_text FROM descriptive_answers WHERE attempt_id=?');$saved->execute([$attempt['id']]);$savedAnswers=[];foreach($saved->fetchAll() as $row)$savedAnswers[(int)$row['descriptive_question_id']]=$row['answer_text'];
+            foreach($descriptiveQuestions as $question){
+                $questionId=(int)$question['id'];$answerKey='d'.$questionId;$max+=(float)$question['max_marks'];$submitted=$expired?($savedAnswers[$questionId]??''):($answers[$answerKey]??($savedAnswers[$questionId]??''));if(!is_string($submitted))$submitted='';
+                $accepted=json_decode((string)$question['accepted_answers'],true);$keywords=json_decode((string)$question['keyword_rules'],true);
+                if(!is_array($accepted)||!is_array($keywords))throw new RuntimeException('Descriptive question marking rules are invalid.');
+                $marked=mark_descriptive_answer($submitted,$accepted,$keywords,(float)$question['max_marks'],$question['numeric_tolerance']===null?null:(float)$question['numeric_tolerance'],(bool)$question['ignore_punctuation'],(int)$question['spelling_tolerance']);
+                $ins=$pdo->prepare("INSERT INTO descriptive_answers(attempt_id,descriptive_question_id,answer_text,marks_awarded,marking_status,matched_keywords,marking_explanation,saved_at) VALUES(?,?,?,?,?,?,?,NOW()) ON DUPLICATE KEY UPDATE answer_text=VALUES(answer_text),marks_awarded=VALUES(marks_awarded),marking_status=VALUES(marking_status),matched_keywords=VALUES(matched_keywords),marking_explanation=VALUES(marking_explanation),reviewed_by=NULL,reviewed_at=NULL,review_reason=NULL,saved_at=NOW()");
+                $ins->execute([$attempt['id'],$questionId,$submitted,$marked['marks'],$marked['status'],json_encode($marked['matched'],JSON_UNESCAPED_UNICODE),$marked['explanation']]);
+                if($marked['status']==='pending_review')$needsReview=true;else $score+=(float)$marked['marks'];
+            }
+        }
+        $s=$pdo->prepare("UPDATE exam_attempts SET status='submitted',submitted_at=NOW(),marks_obtained=?,max_marks=? WHERE id=? AND exam_id=? AND student_user_id=? AND status='in_progress'");$s->execute([$needsReview?null:$score,$max,$attempt['id'],$examId,$studentId]);
         if($s->rowCount()!==1)throw new RuntimeException('Attempt could not be finalized because its status changed.');
-        $pct=$max>0?($score/$max*100):0;$pdo->prepare('INSERT INTO results(exam_id,student_user_id,attempt_id,marks_obtained,max_marks,percentage,is_published,created_at) VALUES(?,?,?,?,?,?,0,NOW()) ON DUPLICATE KEY UPDATE marks_obtained=VALUES(marks_obtained),max_marks=VALUES(max_marks),percentage=VALUES(percentage)')->execute([$examId,$studentId,$attempt['id'],$score,$max,$pct]);
-        $pdo->commit();audit($pdo,'exam_submitted','attempt',(string)$attempt['id'],['automatic'=>$expired]);
+        if(!$needsReview)persist_exam_result($pdo,$examId,$studentId,(int)$attempt['id'],$score,$max);
+        $pdo->commit();audit($pdo,'exam_submitted','attempt',(string)$attempt['id'],['automatic'=>$expired,'pending_review'=>$needsReview]);
     }catch(Throwable $e){if($pdo->inTransaction())$pdo->rollBack();throw $e;}
 }
 
@@ -236,7 +269,7 @@ if ($action === 'login') {
     exit;
 }
 
-$titleMap=['dashboard'=>'Dashboard','profile'=>'My profile','change_password'=>'Change password','students'=>'Student management','staff'=>'Staff & teachers','student_import'=>'Import students','subjects'=>'Subjects','questions'=>'Question bank','exams'=>'Examinations','take_exam'=>'Take examination','results'=>'Results & reports','settings'=>'Institution branding & settings','policies'=>'Policies & examination rules','audit'=>'Audit log','public_policies'=>'Policies & examination rules'];
+$titleMap=['dashboard'=>'Dashboard','profile'=>'My profile','change_password'=>'Change password','students'=>'Student management','staff'=>'Staff & teachers','student_import'=>'Import students','subjects'=>'Subjects','questions'=>'Question bank','descriptive_questions'=>'Typing answer questions','descriptive_review'=>'Typing answer review','exams'=>'Examinations','take_exam'=>'Take examination','results'=>'Results & reports','result_detail'=>'Result breakdown','settings'=>'Institution branding & settings','policies'=>'Policies & examination rules','audit'=>'Audit log','public_policies'=>'Policies & examination rules'];
 page_start($titleMap[$action] ?? 'Cycle Test Portal',$pdo,$config);
 
 switch($action) {
@@ -421,12 +454,87 @@ case 'questions':
     $q=$pdo->query('SELECT q.id,q.question_text,q.marks,s.subject_name FROM questions q JOIN subjects s ON s.id=q.subject_id ORDER BY q.id DESC LIMIT 100')->fetchAll();echo '<div class="card"><h2>Question bank</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>Subject</th><th>Question</th><th>Marks</th>';if($canManageQuestions)echo '<th>Action</th>';echo '</tr></thead><tbody>';foreach($q as $r){echo '<tr><td>'.(int)$r['id'].'</td><td>'.e($r['subject_name']).'</td><td>'.e($r['question_text']).'</td><td>'.e($r['marks']).'</td>';if($canManageQuestions)echo '<td><a class="btn btn-light btn-sm" href="index.php?action=questions&edit='.(int)$r['id'].'">Edit</a></td>';echo '</tr>';}if(!$q)echo '<tr><td colspan="'.($canManageQuestions?5:4).'">No questions yet.</td></tr>';echo '</tbody></table></div></div>';
     break;
 
+case 'descriptive_questions':
+    require_role(['super_admin','exam_admin','teacher']);
+    $editingId=(int)($_GET['edit']??0);
+    if($_SERVER['REQUEST_METHOD']==='POST'){
+        $id=(int)($_POST['question_id']??0);$examId=(int)($_POST['exam_id']??0);$number=(int)($_POST['question_number']??0);$prompt=trim((string)($_POST['question_text']??''));$max=filter_var($_POST['max_marks']??null,FILTER_VALIDATE_FLOAT);$expected=trim((string)($_POST['expected_answer']??''));$acceptedText=(string)($_POST['accepted_answers']??'');$keywordText=(string)($_POST['keyword_rules']??'');$toleranceRaw=trim((string)($_POST['numeric_tolerance']??''));$spelling=filter_var($_POST['spelling_tolerance']??'0',FILTER_VALIDATE_INT);$ignorePunctuation=isset($_POST['ignore_punctuation'])?1:0;
+        $s=$pdo->prepare("SELECT id,subject_id,exam_pattern FROM exams WHERE id=? AND is_archived=0");$s->execute([$examId]);$examForQuestion=$s->fetch();
+        $accepted=[$expected];foreach(preg_split('/\r\n|\r|\n/',$acceptedText)?:[] as $line){$line=trim($line);if($line!==''&&!in_array($line,$accepted,true))$accepted[]=$line;}
+        $keywordRules=[];$keywordError=false;$weightTotal=0.0;$seenKeywords=[];
+        foreach(preg_split('/\r\n|\r|\n/',$keywordText)?:[] as $line){$line=trim($line);if($line==='')continue;$parts=explode('|',$line);if(count($parts)!==2||trim($parts[0])===''||!is_numeric(trim($parts[1]))||(float)$parts[1]<=0){$keywordError=true;break;}$phrase=trim($parts[0]);$normalizedPhrase=descriptive_normalize_answer($phrase,(bool)$ignorePunctuation);if(isset($seenKeywords[$normalizedPhrase])){$keywordError=true;break;}$seenKeywords[$normalizedPhrase]=true;$weight=(float)$parts[1];$weightTotal+=$weight;$keywordRules[]=['phrase'=>$phrase,'marks'=>$weight];}
+        $numericTolerance=null;if($toleranceRaw!==''){if(!is_numeric($toleranceRaw)||(float)$toleranceRaw<0||(float)$toleranceRaw>99999999.9999||filter_var($expected,FILTER_VALIDATE_FLOAT)===false)$keywordError=true;else $numericTolerance=(float)$toleranceRaw;}
+        if(!$examForQuestion||!in_array($examForQuestion['exam_pattern'],['typing','mixed'],true)||$number<1||$prompt===''||$max===false||$max<=0||$max>999999.99||$expected===''||$keywordError||$weightTotal>((float)$max+0.00001)||$spelling===false||$spelling<0||$spelling>3||strlen($prompt)>60000||strlen($expected)>20000||strlen($acceptedText)>60000||strlen($keywordText)>20000){
+            flash('danger','Check the exam pattern, question number, prompt, positive maximum marks, expected answer, spelling tolerance, and rubric weights (their total must not exceed maximum marks).');if($id){header('Location: index.php?action=descriptive_questions&edit='.$id);exit;}redirect('descriptive_questions');
+        }
+        try{
+            if($id){$s=$pdo->prepare('SELECT exam_id FROM descriptive_questions WHERE id=?');$s->execute([$id]);$existingExamId=$s->fetchColumn();if(!$existingExamId||(int)$existingExamId!==$examId)throw new RuntimeException('A descriptive question cannot be moved to another exam.');}
+            $s=$pdo->prepare("SELECT COUNT(*) FROM exam_attempts WHERE exam_id=?");$s->execute([$examId]);if((int)$s->fetchColumn()>0){flash('danger','Descriptive questions are locked after an exam attempt starts.');if($id){header('Location: index.php?action=descriptive_questions&edit='.$id);exit;}redirect('descriptive_questions');}
+            $acceptedJson=json_encode($accepted,JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);$rulesJson=json_encode($keywordRules,JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);
+            if($id){$s=$pdo->prepare('UPDATE descriptive_questions SET exam_id=?,subject_id=?,question_number=?,question_text=?,max_marks=?,accepted_answers=?,keyword_rules=?,numeric_tolerance=?,ignore_punctuation=?,spelling_tolerance=? WHERE id=?');$s->execute([$examId,$examForQuestion['subject_id'],$number,$prompt,$max,$acceptedJson,$rulesJson,$numericTolerance,$ignorePunctuation,$spelling,$id]);audit($pdo,'descriptive_question_updated','descriptive_question',(string)$id);flash('success','Typing question updated.');}
+            else{$s=$pdo->prepare('INSERT INTO descriptive_questions(exam_id,subject_id,question_number,question_text,max_marks,accepted_answers,keyword_rules,numeric_tolerance,ignore_punctuation,spelling_tolerance,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,NOW())');$s->execute([$examId,$examForQuestion['subject_id'],$number,$prompt,$max,$acceptedJson,$rulesJson,$numericTolerance,$ignorePunctuation,$spelling,current_user()['id']]);$newId=(int)$pdo->lastInsertId();audit($pdo,'descriptive_question_created','descriptive_question',(string)$newId);flash('success','Typing question created.');}
+        }catch(Throwable $e){error_log('Cycle Exam descriptive question save error: '.$e->getMessage());flash('danger','Typing question could not be saved. Verify the question number is unique within this exam.');}
+        redirect('descriptive_questions');
+    }
+    $exams=$pdo->query("SELECT e.id,e.title,e.exam_pattern,e.subject_id,s.subject_name FROM exams e JOIN subjects s ON s.id=e.subject_id WHERE e.is_archived=0 AND e.exam_pattern IN ('typing','mixed') ORDER BY e.start_at DESC")->fetchAll();
+    $editQuestion=null;$editQuestionLocked=false;if($editingId){$s=$pdo->prepare('SELECT * FROM descriptive_questions WHERE id=?');$s->execute([$editingId]);$editQuestion=$s->fetch()?:null;if($editQuestion){$s=$pdo->prepare('SELECT COUNT(*) FROM exam_attempts WHERE exam_id=?');$s->execute([$editQuestion['exam_id']]);$editQuestionLocked=(int)$s->fetchColumn()>0;}}
+    if($editingId&&!$editQuestion)echo '<div class="alert alert-danger">Typing question not found.</div>';
+    $selectedExamId=(int)($editQuestion['exam_id']??($_GET['exam_id']??0));
+    $acceptedExisting=$editQuestion?json_decode((string)$editQuestion['accepted_answers'],true):[];$acceptedExtra=is_array($acceptedExisting)?array_slice($acceptedExisting,1):[];
+    $keywordExisting=$editQuestion?json_decode((string)$editQuestion['keyword_rules'],true):[];$keywordLines=[];if(is_array($keywordExisting))foreach($keywordExisting as $rule)if(is_array($rule))$keywordLines[]=(string)$rule['phrase'].'|'.(string)$rule['marks'];
+    echo '<div class="card"><h2>'.($editQuestion?'Edit typing question':'Create typing-answer question').'</h2><p class="muted">To add a written question: create a Typing Answer or Mixed Exam first, then fill in the question form below and press Add typing question. Students type their responses later in the exam.</p><p class="muted">Expected answers and marking rules are private and never sent to student exam pages. Keyword rules use one phrase and weight per line: <code>phrase|marks</code>.</p>';
+    if($editQuestionLocked)echo '<div class="alert alert-warning">This exam has attempts; its question and marking key are locked.</div>';
+    elseif(!$exams)echo '<div class="alert alert-warning">There is no Typing Answer or Mixed Exam available yet. Create one first, then come back here to enter the question text and answer key.</div><a class="btn btn-primary" href="index.php?action=exams">1. Create a Typing Answer exam</a>';
+    else{
+        echo '<form method="post" class="descriptive-question-form">';csrf_input();if($editQuestion)echo '<input type="hidden" name="question_id" value="'.(int)$editQuestion['id'].'">';
+        echo '<label class="field"><span>Exam</span><select name="exam_id" required>';foreach($exams as $examOption)echo '<option value="'.(int)$examOption['id'].'"'.($selectedExamId===(int)$examOption['id']?' selected':'').'>'.e($examOption['title'].' — '.$examOption['subject_name'].' ('.ucfirst($examOption['exam_pattern']).')').'</option>';echo '</select></label>';
+        $examSubjectNames=[];foreach($exams as $examOption)$examSubjectNames[(int)$examOption['id']]=$examOption['subject_name'];$selectedSubject=$examSubjectNames[$selectedExamId]??false;
+        echo '<p class="muted">Subject: '.e($selectedSubject?:'The selected exam subject').'</p><div class="form-grid">';
+        post_field('question_number','Question number','number',(string)($editQuestion['question_number']??''),true,'min="1"');post_field('max_marks','Maximum marks','number',(string)($editQuestion['max_marks']??'5'),true,'min="0.01" step="0.01"');echo '</div>';
+        echo '<label class="field"><span>Question text — type the prompt students will answer</span><textarea name="question_text" rows="4" required maxlength="60000" placeholder="Type the full question or instruction here">'.e($editQuestion['question_text']??'').'</textarea></label>';
+        echo '<label class="field"><span>Expected answer / answer key — private, students cannot see this</span><textarea name="expected_answer" rows="3" required maxlength="20000" placeholder="Type the correct answer or a model answer here">'.e($acceptedExisting[0]??'').'</textarea></label>';
+        echo '<label class="field"><span>Other accepted answers (optional, one answer per line)</span><textarea name="accepted_answers" rows="3" placeholder="Add equivalent answers, one on each line">'.e(implode("\n",$acceptedExtra)).'</textarea></label>';
+        echo '<label class="field"><span>Required keywords and marks (optional, phrase|marks, one per line)</span><textarea name="keyword_rules" rows="4" placeholder="photosynthesis|2&#10;chlorophyll|1">'.e(implode("\n",$keywordLines)).'</textarea><small class="muted">Example: <code>photosynthesis|2</code> awards 2 marks when that phrase appears.</small></label><div class="form-grid">';
+        post_field('numeric_tolerance','Numeric tolerance (optional)','number',(string)($editQuestion['numeric_tolerance']??''),false,'min="0" step="0.0001"');post_field('spelling_tolerance','Spelling tolerance (ASCII edit count, 0 = off)','number',(string)($editQuestion['spelling_tolerance']??'0'),false,'min="0" max="3" step="1"');echo '</div><label class="field"><span><input type="checkbox" name="ignore_punctuation" value="1"'.((!$editQuestion||(int)$editQuestion['ignore_punctuation']===1)?' checked':'').'> Ignore punctuation when comparing answers</span></label><div class="form-actions"><button class="btn btn-primary">'.($editQuestion?'Save typing question':'Add typing question').'</button>'.($editQuestion?'<a class="btn btn-light" href="index.php?action=descriptive_questions">Cancel</a>':'').'</div></form>';
+    }echo '</div>';
+    $questionRows=$pdo->query('SELECT dq.id,dq.exam_id,dq.question_number,dq.question_text,dq.max_marks,e.title,s.subject_name,(SELECT COUNT(*) FROM exam_attempts ea WHERE ea.exam_id=dq.exam_id) AS has_attempts FROM descriptive_questions dq JOIN exams e ON e.id=dq.exam_id JOIN subjects s ON s.id=dq.subject_id ORDER BY e.start_at DESC,dq.question_number')->fetchAll();
+    echo '<div class="card"><h2>Typing-answer questions</h2><div class="table-wrap"><table><thead><tr><th>Exam</th><th>Question no.</th><th>Subject</th><th>Question</th><th>Maximum marks</th><th></th></tr></thead><tbody>';foreach($questionRows as $row)echo '<tr><td>'.e($row['title']).'</td><td>'.(int)$row['question_number'].'</td><td>'.e($row['subject_name']).'</td><td>'.e($row['question_text']).'</td><td>'.e($row['max_marks']).'</td><td>'.(!(int)$row['has_attempts']?'<a class="btn btn-light btn-sm" href="index.php?action=descriptive_questions&edit='.(int)$row['id'].'">Edit</a>':'Locked').'</td></tr>';if(!$questionRows)echo '<tr><td colspan="6">No typing-answer questions created.</td></tr>';echo '</tbody></table></div></div>';
+    break;
+
+case 'descriptive_review':
+    require_role(['super_admin','exam_admin','teacher']);
+    if($_SERVER['REQUEST_METHOD']==='POST'){
+        $answerId=(int)($_POST['answer_id']??0);$awarded=filter_var($_POST['awarded_marks']??null,FILTER_VALIDATE_FLOAT);$reason=trim((string)($_POST['review_reason']??''));
+        if($answerId<1||$awarded===false||$reason===''||strlen($reason)>2000){flash('danger','Enter valid marks and a review reason (up to 2,000 characters).');redirect('descriptive_review');}
+        $pdo->beginTransaction();
+        try{
+            $s=$pdo->prepare('SELECT da.*,dq.max_marks,dq.exam_id,ea.id AS attempt_id,ea.student_user_id,ea.status AS attempt_status FROM descriptive_answers da JOIN descriptive_questions dq ON dq.id=da.descriptive_question_id JOIN exam_attempts ea ON ea.id=da.attempt_id WHERE da.id=? FOR UPDATE');$s->execute([$answerId]);$answerRow=$s->fetch();
+            if(!$answerRow||!in_array($answerRow['attempt_status'],['submitted','evaluated'],true)||$awarded<0||(float)$awarded>(float)$answerRow['max_marks'])throw new RuntimeException('Answer is unavailable or the score exceeds the question maximum.');
+            $pdo->prepare('INSERT INTO descriptive_answer_reviews(descriptive_answer_id,reviewer_user_id,previous_marks,awarded_marks,reason,created_at) VALUES(?,?,?,?,?,NOW())')->execute([$answerId,current_user()['id'],$answerRow['marks_awarded'],$awarded,$reason]);
+            $pdo->prepare("UPDATE descriptive_answers SET marks_awarded=?,marking_status='teacher_reviewed',marking_explanation=?,reviewed_by=?,reviewed_at=NOW(),review_reason=? WHERE id=?")->execute([$awarded,'Teacher-reviewed: '.$reason,current_user()['id'],$reason,$answerId]);
+            $s=$pdo->prepare("SELECT COUNT(*) FROM descriptive_answers da JOIN exam_attempts ea ON ea.id=da.attempt_id WHERE ea.id=? AND da.marking_status='pending_review'");$s->execute([$answerRow['attempt_id']]);$pending=(int)$s->fetchColumn();
+            if($pending===0){
+                $s=$pdo->prepare('SELECT COALESCE(SUM(aa.marks_awarded),0) FROM attempt_answers aa WHERE aa.attempt_id=?');$s->execute([$answerRow['attempt_id']]);$score=(float)$s->fetchColumn();
+                $s=$pdo->prepare('SELECT COALESCE(SUM(q.marks),0) FROM exam_attempts ea JOIN exams e ON e.id=ea.exam_id JOIN questions q ON q.subject_id=e.subject_id WHERE ea.id=?');$s->execute([$answerRow['attempt_id']]);$mcqMax=(float)$s->fetchColumn();
+                $s=$pdo->prepare('SELECT COALESCE(SUM(dq.max_marks),0),COALESCE(SUM(da.marks_awarded),0) FROM descriptive_questions dq JOIN descriptive_answers da ON da.descriptive_question_id=dq.id WHERE da.attempt_id=?');$s->execute([$answerRow['attempt_id']]);$totals=$s->fetch(PDO::FETCH_NUM);$max=$mcqMax+(float)$totals[0];$score+=(float)$totals[1];
+                persist_exam_result($pdo,(int)$answerRow['exam_id'],(int)$answerRow['student_user_id'],(int)$answerRow['attempt_id'],$score,$max,true);
+            }
+            $pdo->commit();audit($pdo,'descriptive_answer_reviewed','descriptive_answer',(string)$answerId,['awarded_marks'=>(float)$awarded,'reason'=>$reason]);flash('success',$pending?'Review saved; the attempt remains pending other answers.':'Review saved; final result is now available for publication.');
+        }catch(Throwable $e){if($pdo->inTransaction())$pdo->rollBack();error_log('Cycle Exam descriptive review error: '.$e->getMessage());flash('danger','Review could not be saved. Confirm the score is within the question maximum.');}
+        redirect('descriptive_review');
+    }
+    $rows=$pdo->query("SELECT da.id AS answer_id,da.answer_text,da.marks_awarded,da.marking_status,da.matched_keywords,da.marking_explanation,da.review_reason,dq.question_number,dq.question_text,dq.max_marks,dq.accepted_answers,dq.keyword_rules,e.title,u.display_name,u.login_id,ea.id AS attempt_id FROM descriptive_answers da JOIN descriptive_questions dq ON dq.id=da.descriptive_question_id JOIN exam_attempts ea ON ea.id=da.attempt_id JOIN exams e ON e.id=dq.exam_id JOIN users u ON u.id=ea.student_user_id WHERE ea.status IN ('submitted','evaluated') ORDER BY (da.marking_status='pending_review') DESC,ea.submitted_at DESC,dq.question_number LIMIT 200")->fetchAll();
+    echo '<div class="card"><h2>Descriptive answers for review</h2><p class="muted">Pending review scores are not included in published results. Teacher score changes require a reason and are recorded in the review audit trail.</p></div>';
+    foreach($rows as $row){$accepted=json_decode((string)$row['accepted_answers'],true);$rules=json_decode((string)$row['keyword_rules'],true);$matched=json_decode((string)$row['matched_keywords'],true);echo '<div class="card"><h3>'.e($row['title']).' · Question '.(int)$row['question_number'].' · '.e($row['display_name']).' ('.e($row['login_id']).')</h3><p><b>Question:</b> '.nl2br(e($row['question_text'])).' <span class="pill">'.e($row['max_marks']).' max</span></p><p><b>Student answer:</b><br>'.nl2br(e($row['answer_text'])).'</p><p><b>Automatic marking status:</b> '.e(str_replace('_',' ',$row['marking_status'])).' · <b>Automatic score:</b> '.($row['marks_awarded']===null?'Pending':e($row['marks_awarded'])).' / '.e($row['max_marks']).'</p><p><b>Matched keywords:</b> '.e(is_array($matched)?implode(', ',$matched):'None').'<br><b>Explanation:</b> '.e($row['marking_explanation']??'').'</p><details><summary>Private answer key and rubric</summary><p><b>Accepted answers:</b> '.e(is_array($accepted)?implode(' | ',$accepted):'').'</p><p><b>Keyword marks:</b> '.e(is_array($rules)?implode(', ',array_map(static fn($rule)=>$rule['phrase'].'='.$rule['marks'],$rules)):'').'</p></details><form method="post" class="form-grid">';csrf_input();echo '<input type="hidden" name="answer_id" value="'.(int)$row['answer_id'].'">';post_field('awarded_marks','Teacher-reviewed marks','number',(string)($row['marks_awarded']??'0'),true,'min="0" max="'.e($row['max_marks']).'" step="0.01"');echo '<label class="field"><span>Review reason (required)</span><textarea name="review_reason" rows="2" maxlength="2000" required>'.e($row['review_reason']??'').'</textarea></label><button class="btn btn-primary">Save teacher review</button></form></div>';}
+    if(!$rows)echo '<div class="card">No submitted descriptive answers are waiting for review.</div>';
+    break;
+
 case 'exams':
     require_role(['super_admin','exam_admin','teacher','student']);
     if(current_user()['role']!=='student' && $_SERVER['REQUEST_METHOD']==='POST'){
         require_role(['super_admin','exam_admin']);
-        $title=trim((string)($_POST['title']??''));$subject=(int)($_POST['subject_id']??0);$start=str_replace('T',' ',(string)($_POST['start_at']??''));$end=str_replace('T',' ',(string)($_POST['end_at']??''));$duration=(int)($_POST['duration_minutes']??0);$marks=(float)($_POST['total_marks']??0);$pass=(float)($_POST['pass_marks']??0);$dept=(int)($_POST['department_id']??0);$year=trim((string)($_POST['year_level']??''));$status=(string)($_POST['status']??'scheduled');$examId=(int)($_POST['exam_id']??0);
-        if(!in_array($status,['draft','scheduled','active','closed'],true)){$status='invalid';}
+        $title=trim((string)($_POST['title']??''));$subject=(int)($_POST['subject_id']??0);$pattern=(string)($_POST['exam_pattern']??'mcq');$start=str_replace('T',' ',(string)($_POST['start_at']??''));$end=str_replace('T',' ',(string)($_POST['end_at']??''));$duration=(int)($_POST['duration_minutes']??0);$marks=(float)($_POST['total_marks']??0);$pass=(float)($_POST['pass_marks']??0);$dept=(int)($_POST['department_id']??0);$year=trim((string)($_POST['year_level']??''));$status=(string)($_POST['status']??'scheduled');$examId=(int)($_POST['exam_id']??0);
+        if(!in_array($status,['draft','scheduled','active','closed'],true)){$status='invalid';}if(!in_array($pattern,['mcq','typing','mixed'],true)){$pattern='invalid';}
         if($examId>0){
             $pdo->beginTransaction();
             try{
@@ -436,20 +544,20 @@ case 'exams':
                 if($hasAttempts){
                     if(!in_array($status,['active','closed'],true)){flash('danger','After an attempt exists, the status can only be Active or Closed.');}
                     else{$pdo->prepare('UPDATE exams SET status=? WHERE id=?')->execute([$status,$examId]);audit($pdo,'exam_status_updated','exam',(string)$examId,['status'=>$status]);flash('success','Examination status updated. Schedule details stay locked after an attempt exists.');}
-                }elseif(!$title||!$subject||!$start||!$end||$duration<1||$marks<=0||$pass<0||$pass>$marks||strtotime($end)<=strtotime($start)||$status==='invalid'){
+                }elseif(!$title||!$subject||!$start||!$end||$duration<1||$marks<=0||$pass<0||$pass>$marks||strtotime($end)<=strtotime($start)||$status==='invalid'||$pattern==='invalid'){
                     flash('danger','Check title, subject, dates, duration, marks and status.');
                 }else{
                     $s=$pdo->prepare('SELECT id FROM subjects WHERE id=? AND is_active=1');$s->execute([$subject]);
                     if(!$s->fetchColumn()){flash('danger','Choose an active subject.');}
-                    else{$s=$pdo->prepare('UPDATE exams SET title=?,subject_id=?,start_at=?,end_at=?,duration_minutes=?,total_marks=?,pass_marks=?,department_id=?,year_level=?,status=? WHERE id=? AND is_archived=0');$s->execute([$title,$subject,date('Y-m-d H:i:s',strtotime($start)),date('Y-m-d H:i:s',strtotime($end)),$duration,$marks,$pass,$dept?:null,$year?:null,$status,$examId]);audit($pdo,'exam_updated','exam',(string)$examId);flash('success','Examination schedule updated.');}
+                    else{$s=$pdo->prepare('UPDATE exams SET title=?,subject_id=?,exam_pattern=?,start_at=?,end_at=?,duration_minutes=?,total_marks=?,pass_marks=?,department_id=?,year_level=?,status=? WHERE id=? AND is_archived=0');$s->execute([$title,$subject,$pattern,date('Y-m-d H:i:s',strtotime($start)),date('Y-m-d H:i:s',strtotime($end)),$duration,$marks,$pass,$dept?:null,$year?:null,$status,$examId]);audit($pdo,'exam_updated','exam',(string)$examId,['exam_pattern'=>$pattern]);flash('success','Examination schedule updated.');}
                 }
                 $pdo->commit();
             }catch(Throwable $e){if($pdo->inTransaction())$pdo->rollBack();error_log('Cycle Exam schedule update error: '.$e->getMessage());flash('danger','Examination could not be updated. Please review the schedule and try again.');}
             redirect('exams');
         }
-        if(!$title||!$subject||!$start||!$end||$duration<1||$marks<=0||$pass<0||$pass>$marks||strtotime($end)<=strtotime($start)||$status==='invalid'){
+        if(!$title||!$subject||!$start||!$end||$duration<1||$marks<=0||$pass<0||$pass>$marks||strtotime($end)<=strtotime($start)||$status==='invalid'||$pattern==='invalid'){
             flash('danger','Check title, subject, dates, duration, marks and status.');
-        }else{$s=$pdo->prepare('SELECT id FROM subjects WHERE id=? AND is_active=1');$s->execute([$subject]);if(!$s->fetchColumn()){flash('danger','Choose an active subject.');}else{$s=$pdo->prepare('INSERT INTO exams(title,subject_id,start_at,end_at,duration_minutes,total_marks,pass_marks,department_id,year_level,status,is_archived,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,0,?,NOW())');$s->execute([$title,$subject,date('Y-m-d H:i:s',strtotime($start)),date('Y-m-d H:i:s',strtotime($end)),$duration,$marks,$pass,$dept?:null,$year?:null,$status,current_user()['id']]);audit($pdo,'exam_created','exam',(string)$pdo->lastInsertId());flash('success','Exam created and scheduled.');}}
+        }else{$s=$pdo->prepare('SELECT id FROM subjects WHERE id=? AND is_active=1');$s->execute([$subject]);if(!$s->fetchColumn()){flash('danger','Choose an active subject.');}else{$s=$pdo->prepare('INSERT INTO exams(title,subject_id,exam_pattern,start_at,end_at,duration_minutes,total_marks,pass_marks,department_id,year_level,status,is_archived,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?,NOW())');$s->execute([$title,$subject,$pattern,date('Y-m-d H:i:s',strtotime($start)),date('Y-m-d H:i:s',strtotime($end)),$duration,$marks,$pass,$dept?:null,$year?:null,$status,current_user()['id']]);audit($pdo,'exam_created','exam',(string)$pdo->lastInsertId(),['exam_pattern'=>$pattern]);flash('success','Exam created and scheduled.');}}
         redirect('exams');
     }
     if(in_array(current_user()['role'],['super_admin','exam_admin'],true)){
@@ -460,7 +568,7 @@ case 'exams':
         if($edit&&$attemptCount>0)echo '<div class="alert alert-warning">Students have started this exam. Schedule details are locked to protect their attempts. You can still change the status.</div>';
         echo '<form method="post">';csrf_input();if($edit)echo '<input type="hidden" name="exam_id" value="'.(int)$edit['id'].'">';
         if(!$edit||$attemptCount===0){
-            post_field('title','Exam title (e.g. October Cycle Test)','text',(string)($edit['title']??''),true);echo '<label class="field"><span>Subject</span><select name="subject_id" required><option value="">Choose subject</option>';foreach($subjects as $subj)echo '<option value="'.(int)$subj['id'].'"'.((int)($edit['subject_id']??0)===(int)$subj['id']?' selected':'').'>'.e($subj['subject_name']).'</option>';echo '</select></label><div class="form-grid">';
+            post_field('title','Exam title (e.g. October Cycle Test)','text',(string)($edit['title']??''),true);echo '<label class="field"><span>Subject</span><select name="subject_id" required><option value="">Choose subject</option>';foreach($subjects as $subj)echo '<option value="'.(int)$subj['id'].'"'.((int)($edit['subject_id']??0)===(int)$subj['id']?' selected':'').'>'.e($subj['subject_name']).'</option>';echo '</select></label><label class="field"><span>Exam pattern</span><select name="exam_pattern" required>';foreach(['mcq'=>'MCQ','typing'=>'Typing Answer','mixed'=>'Mixed Exam'] as $patternValue=>$patternLabel)echo '<option value="'.$patternValue.'"'.(($edit['exam_pattern']??'mcq')===$patternValue?' selected':'').'>'.$patternLabel.'</option>';echo '</select><small class="muted">Choose Typing Answer or Mixed Exam, save the exam, then open Typing questions to enter the prompt and answer key.</small></label><div class="form-grid">';
             post_field('start_at','Start date/time','datetime-local',$edit?date('Y-m-d\\TH:i',strtotime($edit['start_at'])):'',true);post_field('end_at','End date/time','datetime-local',$edit?date('Y-m-d\\TH:i',strtotime($edit['end_at'])):'',true);post_field('duration_minutes','Duration (minutes)','number',(string)($edit['duration_minutes']??30),true,'min="1"');post_field('total_marks','Total marks','number',(string)($edit['total_marks']??20),true,'min="0.01" step="0.01"');post_field('pass_marks','Pass marks','number',(string)($edit['pass_marks']??10),true,'min="0" step="0.01"');echo '<label class="field"><span>Department (optional)</span><select name="department_id"><option value="0">All departments</option>';foreach($depts as $d)echo '<option value="'.(int)$d['id'].'"'.((int)($edit['department_id']??0)===(int)$d['id']?' selected':'').'>'.e($d['department_name']).'</option>';echo '</select></label>';post_field('year_level','Year / level (optional)','text',(string)($edit['year_level']??''));echo '</div>';
         }else{echo '<p><b>'.e($edit['title']).'</b> · '.e($edit['start_at']).' to '.e($edit['end_at']).' · '.(int)$edit['duration_minutes'].' minutes</p>';}
         echo '<label class="field"><span>Exam status</span><select name="status">';$allowedStatuses=$attemptCount>0?['active'=>'Active','closed'=>'Closed']:['draft'=>'Draft','scheduled'=>'Scheduled','active'=>'Active','closed'=>'Closed'];foreach($allowedStatuses as $value=>$label)echo '<option value="'.$value.'"'.(($edit['status']??'scheduled')===$value?' selected':'').'>'.$label.'</option>';echo '</select></label><div class="form-actions"><button class="btn btn-primary">'.($edit?'Save examination':'Create exam').'</button>'.($edit?'<a class="btn btn-light" href="index.php?action=exams">Cancel</a>':'').'</div></form>';
@@ -469,12 +577,12 @@ case 'exams':
     $canManageExams=in_array(current_user()['role'],['super_admin','exam_admin'],true);
     if(current_user()['role']==='student'){$s=$pdo->prepare("SELECT e.*,s.subject_name FROM exams e JOIN subjects s ON s.id=e.subject_id LEFT JOIN student_profiles sp ON sp.user_id=? WHERE e.is_archived=0 AND e.status IN ('scheduled','active','closed','evaluated','published') AND (e.department_id IS NULL OR e.department_id=sp.department_id) AND (e.year_level IS NULL OR e.year_level=sp.year_level) ORDER BY e.start_at DESC LIMIT 100");$s->execute([current_user()['id']]);$rows=$s->fetchAll();}
     else{$rows=$pdo->query('SELECT e.*,s.subject_name FROM exams e JOIN subjects s ON s.id=e.subject_id WHERE e.is_archived=0 ORDER BY e.start_at DESC LIMIT 100')->fetchAll();}
-    echo '<div class="card"><h2>Examination schedule</h2>';if(current_user()['role']==='student')echo '<p class="muted">Use Take exam during the scheduled window. If an attempt is already in progress, resume it here or from Dashboard.</p>';echo '<div class="table-wrap"><table><thead><tr><th>Exam</th><th>Subject</th><th>Start</th><th>End</th><th>Duration</th><th>Status</th>';if($canManageExams||current_user()['role']==='student')echo '<th>Action</th>';echo '</tr></thead><tbody>';
-    foreach($rows as $r){echo '<tr><td>'.e($r['title']).'</td><td>'.e($r['subject_name']).'</td><td>'.e($r['start_at']).'</td><td>'.e($r['end_at']).'</td><td>'.(int)$r['duration_minutes'].' min</td>';
+    echo '<div class="card"><h2>Examination schedule</h2>';if(current_user()['role']==='student')echo '<p class="muted">Use Take exam during the scheduled window. If an attempt is already in progress, resume it here or from Dashboard.</p>';echo '<div class="table-wrap"><table><thead><tr><th>Exam</th><th>Subject</th><th>Pattern</th><th>Start</th><th>End</th><th>Duration</th><th>Status</th>';if($canManageExams||current_user()['role']==='student')echo '<th>Action</th>';echo '</tr></thead><tbody>';
+    foreach($rows as $r){echo '<tr><td>'.e($r['title']).'</td><td>'.e($r['subject_name']).'</td><td>'.e(ucfirst($r['exam_pattern']??'mcq')).'</td><td>'.e($r['start_at']).'</td><td>'.e($r['end_at']).'</td><td>'.(int)$r['duration_minutes'].' min</td>';
         if(current_user()['role']==='student'){$a=$pdo->prepare('SELECT id,status,started_at FROM exam_attempts WHERE exam_id=? AND student_user_id=? LIMIT 1');$a->execute([$r['id'],current_user()['id']]);$attempt=$a->fetch()?:null;$access=student_exam_access($r,$attempt);echo '<td><span class="pill">'.e($access['label']).'</span></td><td>'.($access['action']?'<a class="btn btn-primary btn-sm" href="index.php?action=take_exam&id='.(int)$r['id'].'">'.e($access['action']).'</a>':'—').'</td>';}
         else{echo '<td><span class="pill">'.e($r['status']).'</span></td>';if($canManageExams)echo '<td><a class="btn btn-light btn-sm" href="index.php?action=exams&edit='.(int)$r['id'].'">Edit / status</a></td>';}
         echo '</tr>';}
-    if(!$rows)echo '<tr><td colspan="'.(($canManageExams||current_user()['role']==='student')?7:6).'">No examinations scheduled for your account.</td></tr>';echo '</tbody></table></div></div>';
+    if(!$rows)echo '<tr><td colspan="'.(($canManageExams||current_user()['role']==='student')?8:7).'">No examinations scheduled for your account.</td></tr>';echo '</tbody></table></div></div>';
     break;
 
 case 'take_exam':
@@ -488,7 +596,7 @@ case 'take_exam':
         $answers=$_POST['answers']??[];$flags=$_POST['flags']??[];if(!is_array($answers))$answers=[];if(!is_array($flags))$flags=[];
         $deadline=min(strtotime($postedAttempt['started_at'])+(int)$exam['duration_minutes']*60,strtotime($exam['end_at']));
         $expired=$exam['status']!=='active'||time()>=$deadline;
-        try{finalize_exam_attempt($pdo,$examId,$studentId,$postedAttempt,$exam,$answers,$flags,$expired);flash('success',$expired?'Your saved answers were submitted. Results will appear after the examination administrator publishes them.':'Your examination was submitted. Results will appear after the examination administrator publishes them.');redirect('dashboard');}
+        try{finalize_exam_attempt($pdo,$examId,$studentId,$postedAttempt,$exam,$answers,$flags,$expired);$pendingCheck=$pdo->prepare("SELECT COUNT(*) FROM descriptive_answers WHERE attempt_id=? AND marking_status='pending_review'");$pendingCheck->execute([$attemptId]);$pendingReviews=(int)$pendingCheck->fetchColumn();flash('success',$pendingReviews?'Your examination was submitted. '.$pendingReviews.' descriptive answer(s) need teacher review before a final result can be published.':'Your examination was submitted. Results will appear after the examination administrator publishes them.');redirect('dashboard');}
         catch(Throwable $e){error_log('Cycle Exam submission error: '.$e->getMessage());flash('danger','Submission could not be completed. Your saved answers are still available; please retry.');header('Location: index.php?action=take_exam&id='.$examId);exit;}
     }
     if($attempt&&$attempt['status']!=='in_progress'){echo '<div class="card"><h2>Attempt submitted</h2><p>Your attempt has already been submitted. A second attempt is not allowed for this examination.</p></div>';break;}
@@ -501,15 +609,30 @@ case 'take_exam':
     }elseif($exam['status']!=='active'||strtotime($exam['start_at'])>time()||strtotime($exam['end_at'])<time()){
         echo '<div class="card">This examination is not currently open.</div>';break;
     }
+    $questions=[];
+    if(in_array($exam['exam_pattern']??'mcq',['mcq','mixed'],true)){
+        $q=$pdo->prepare('SELECT id,question_text,option_a,option_b,option_c,option_d,marks FROM questions WHERE subject_id=? ORDER BY id');$q->execute([$exam['subject_id']]);foreach($q->fetchAll() as $item){$item['question_type']='mcq';$item['question_number']=count($questions)+1;$questions[]=$item;}
+    }
+    if(in_array($exam['exam_pattern']??'mcq',['typing','mixed'],true)){
+        $q=$pdo->prepare('SELECT id,question_number,question_text,max_marks AS marks FROM descriptive_questions WHERE exam_id=? ORDER BY question_number,id');$q->execute([$examId]);foreach($q->fetchAll() as $item){$item['question_type']='typing';$questions[]=$item;}
+    }
+    if(!$questions){echo '<div class="card"><h2>No questions available</h2><p>Contact an examination administrator or teacher to configure questions for this exam. No attempt was started.</p></div>';break;}
     if(!$attempt){$pdo->prepare("INSERT INTO exam_attempts(exam_id,student_user_id,status,started_at) VALUES(?,?,'in_progress',NOW())")->execute([$examId,$studentId]);$attemptId=(int)$pdo->lastInsertId();$attempt=['id'=>$attemptId,'started_at'=>date('Y-m-d H:i:s')];}else $attemptId=(int)$attempt['id'];
     $deadline=min(strtotime($attempt['started_at'])+(int)$exam['duration_minutes']*60,strtotime($exam['end_at']));
-    $q=$pdo->prepare('SELECT id,question_text,option_a,option_b,option_c,option_d,marks FROM questions WHERE subject_id=? ORDER BY id');$q->execute([$exam['subject_id']]);$questions=$q->fetchAll();
-    $saved=$pdo->prepare('SELECT question_id,selected_option,is_flagged FROM attempt_answers WHERE attempt_id=?');$saved->execute([$attemptId]);$answers=[];$flags=[];foreach($saved->fetchAll() as $a){$qid=(int)$a['question_id'];$answers[$qid]=$a['selected_option'];$flags[$qid]=(int)$a['is_flagged']===1;}
-    if(!$questions){echo '<div class="card"><h2>No questions available</h2><p>Contact your examination administrator. The attempt has been created but cannot be completed until questions are configured.</p></div>';break;}
+    $answers=[];$flags=[];$saved=$pdo->prepare('SELECT question_id,selected_option,is_flagged FROM attempt_answers WHERE attempt_id=?');$saved->execute([$attemptId]);foreach($saved->fetchAll() as $a){$qid=(int)$a['question_id'];$answers['m'.$qid]=$a['selected_option'];$flags['m'.$qid]=(int)$a['is_flagged']===1;}
+    $saved=$pdo->prepare('SELECT descriptive_question_id,answer_text FROM descriptive_answers WHERE attempt_id=?');$saved->execute([$attemptId]);foreach($saved->fetchAll() as $a)$answers['d'.(int)$a['descriptive_question_id']]=$a['answer_text'];
     echo '<div class="exam-top card"><div><h2>'.e($exam['title']).'</h2><p>'.e($exam['subject_name']).' · <span id="exam-progress">0 of '.count($questions).' answered</span></p></div><div class="timer" id="exam-timer" data-deadline="'.(int)$deadline.'">--:--</div></div><div id="exam-connectivity" class="alert alert-success exam-connectivity" role="status"><span id="exam-connection-text">Connected — answers save automatically.</span><button class="btn btn-light btn-sm" type="button" id="exam-fullscreen">Optional fullscreen</button></div><div id="exam-focus-warning" class="alert alert-warning exam-focus-warning" role="status" hidden></div><p class="muted small">If your connection drops, keep this page open and reconnect. This web exam can warn when you switch apps, but cannot lock your phone or prevent tab switching.</p><form method="post" id="exam-form" class="exam-form" data-attempt-id="'.$attemptId.'">';csrf_input();echo '<input type="hidden" name="exam_id" value="'.$examId.'"><input type="hidden" name="attempt_id" value="'.$attemptId.'"><div class="exam-layout"><div class="exam-questions">';
-    foreach($questions as $i=>$q){$qid=(int)$q['id'];echo '<section class="card question-card" data-question-index="'.$i.'"><div class="question-number">QUESTION '.($i+1).' · '.e($q['marks']).' mark(s)</div><h3>'.e($q['question_text']).'</h3>';foreach(['A'=>'option_a','B'=>'option_b','C'=>'option_c','D'=>'option_d'] as $letter=>$col)echo '<label class="option"><input type="radio" name="answers['.$qid.']" value="'.$letter.'" data-question-id="'.$qid.'" '.(($answers[$qid]??'')===$letter?'checked':'').'> <span><b>'.$letter.'.</b> '.e($q[$col]).'</span></label>';echo '<input type="hidden" name="flags['.$qid.']" value="'.(!empty($flags[$qid])?'1':'0').'" data-flag-value data-question-id="'.$qid.'"><div class="question-actions"><span class="muted">Question '.($i+1).' of '.count($questions).'</span><button class="btn btn-light btn-sm" type="button" data-flag-button data-question-id="'.$qid.'" aria-pressed="'.(!empty($flags[$qid])?'true':'false').'">'.(!empty($flags[$qid])?'Unflag question':'Flag for review').'</button></div></section>';}
+    foreach($questions as $i=>$q){
+        $qid=(int)$q['id'];$answerKey=($q['question_type']==='typing'?'d':'m').$qid;$label=$q['question_type']==='typing'?'Written question':'MCQ question';
+        echo '<section class="card question-card" data-question-index="'.$i.'"><div class="question-number">'.e($label).' '.(int)$q['question_number'].' · '.e($q['marks']).' mark(s)</div><h3>'.e($q['question_text']).'</h3>';
+        if($q['question_type']==='typing')echo '<label class="field"><span>Your answer</span><textarea name="answers['.$answerKey.']" data-question-id="'.$answerKey.'" rows="7" maxlength="60000" autocomplete="off">'.e($answers[$answerKey]??'').'</textarea></label>';
+        else foreach(['A'=>'option_a','B'=>'option_b','C'=>'option_c','D'=>'option_d'] as $letter=>$col)echo '<label class="option"><input type="radio" name="answers['.$answerKey.']" value="'.$letter.'" data-question-id="'.$answerKey.'" '.(($answers[$answerKey]??'')===$letter?'checked':'').'> <span><b>'.$letter.'.</b> '.e($q[$col]).'</span></label>';
+        echo '<div class="question-actions"><span class="muted">Question '.($i+1).' of '.count($questions).'</span>';
+        if($q['question_type']==='mcq')echo '<input type="hidden" name="flags['.$answerKey.']" value="'.(!empty($flags[$answerKey])?'1':'0').'" data-flag-value data-question-id="'.$answerKey.'"><button class="btn btn-light btn-sm" type="button" data-flag-button data-question-id="'.$answerKey.'" aria-pressed="'.(!empty($flags[$answerKey])?'true':'false').'">'.(!empty($flags[$answerKey])?'Unflag question':'Flag for review').'</button>';
+        echo '</div></section>';
+    }
     echo '</div><aside class="card question-navigation"><h2>Question navigator</h2><div class="question-nav-grid">';
-    foreach($questions as $i=>$q){$qid=(int)$q['id'];$answered=!empty($answers[$qid]);$flagged=!empty($flags[$qid]);echo '<button class="question-nav-button'.($i===0?' current':'').($answered?' answered':'').($flagged?' flagged':'').'" type="button" data-nav-index="'.$i.'" aria-label="Question '.($i+1).($answered?', answered':', unanswered').($flagged?', flagged for review':'').'">'.($i+1).'</button>';}
+    foreach($questions as $i=>$q){$qid=(int)$q['id'];$answerKey=($q['question_type']==='typing'?'d':'m').$qid;$answered=trim((string)($answers[$answerKey]??''))!=='';$flagged=!empty($flags[$answerKey]);echo '<button class="question-nav-button'.($i===0?' current':'').($answered?' answered':'').($flagged?' flagged':'').'" type="button" data-nav-index="'.$i.'" aria-label="Question '.(int)$q['question_number'].($answered?', answered':', unanswered').($flagged?', flagged for review':'').'">'.(int)$q['question_number'].'</button>';}
     echo '</div><div class="question-legend"><span><i class="legend-dot answered-dot"></i>Answered</span><span><i class="legend-dot"></i>Unanswered</span><span><i class="legend-dot flagged-dot"></i>Flagged</span></div><p id="answer-save-status" class="save-status" role="status" aria-live="polite">Answers save automatically.</p></aside></div><div class="sticky-submit"><button class="btn btn-light" type="button" id="previous-question">Previous</button><span class="muted">Review unanswered questions before submitting.</span><div class="form-actions"><button class="btn btn-light" type="button" id="next-question">Next</button><button class="btn btn-primary" type="submit">Submit exam</button></div></div></form>';
     break;
 
@@ -518,7 +641,17 @@ case 'results':
     if(current_user()['role']!=='student' && $_SERVER['REQUEST_METHOD']==='POST'){require_role(['super_admin','exam_admin']);$id=(int)($_POST['result_id']??0);$s=$pdo->prepare('UPDATE results SET is_published=1,published_at=NOW() WHERE id=?');$s->execute([$id]);audit($pdo,'result_published','result',(string)$id);flash('success','Result published to the student.');redirect('results');}
     if(current_user()['role']==='student'){$s=$pdo->prepare("SELECT r.*,e.title,u.display_name,u.login_id FROM results r JOIN exams e ON e.id=r.exam_id JOIN users u ON u.id=r.student_user_id WHERE r.student_user_id=? AND r.is_published=1 ORDER BY r.published_at DESC");$s->execute([current_user()['id']]);$rows=$s->fetchAll();}
     else {$rows=$pdo->query("SELECT r.*,e.title,u.display_name,u.login_id FROM results r JOIN exams e ON e.id=r.exam_id JOIN users u ON u.id=r.student_user_id ORDER BY r.created_at DESC LIMIT 300")->fetchAll();}
-    echo '<div class="card"><h2>'.(current_user()['role']==='student'?'Your published results':'Exam results · latest 300').'</h2><div class="table-wrap"><table><thead><tr><th>Exam</th><th>Student</th><th>Register no.</th><th>Marks</th><th>Percentage</th><th>Status</th><th></th></tr></thead><tbody>';foreach($rows as $r){$published=(int)$r['is_published'];echo '<tr><td>'.e($r['title']).'</td><td>'.e($r['display_name']).'</td><td>'.e($r['login_id']).'</td><td>'.e($r['marks_obtained']).' / '.e($r['max_marks']).'</td><td>'.number_format((float)$r['percentage'],2).'%</td><td>'.($published?'Published':'Pending').'</td><td>'.(!$published&&current_user()['role']!=='student'?'<form method="post">':'');if(!$published&&current_user()['role']!=='student'){csrf_input();echo '<input type="hidden" name="result_id" value="'.(int)$r['id'].'"><button class="btn btn-primary btn-sm">Publish</button></form>';}echo '</td></tr>';}if(!$rows)echo '<tr><td colspan="7">No results found.</td></tr>';echo '</tbody></table></div></div>';
+    if(current_user()['role']!=='student'){$pendingCount=(int)$pdo->query("SELECT COUNT(DISTINCT ea.id) FROM exam_attempts ea JOIN descriptive_answers da ON da.attempt_id=ea.id WHERE ea.status='submitted' AND da.marking_status='pending_review'")->fetchColumn();if($pendingCount)echo '<div class="alert alert-warning">'.$pendingCount.' descriptive attempt(s) are awaiting review. Their provisional marks are not included in results.</div>';}
+    echo '<div class="card"><h2>'.(current_user()['role']==='student'?'Your published results':'Exam results · latest 300').'</h2><div class="table-wrap"><table><thead><tr><th>Exam</th><th>Student</th><th>Register no.</th><th>Marks</th><th>Percentage</th><th>Status</th><th></th></tr></thead><tbody>';foreach($rows as $r){$published=(int)$r['is_published'];echo '<tr><td>'.e($r['title']).'</td><td>'.e($r['display_name']).'</td><td>'.e($r['login_id']).'</td><td>'.e($r['marks_obtained']).' / '.e($r['max_marks']).'</td><td>'.number_format((float)$r['percentage'],2).'%</td><td>'.($published?'Published':'Pending').'</td><td>'.(!$published&&current_user()['role']!=='student'?'<form method="post">':'');if(!$published&&current_user()['role']!=='student'){csrf_input();echo '<input type="hidden" name="result_id" value="'.(int)$r['id'].'"><button class="btn btn-primary btn-sm">Publish</button></form> ';}echo '<a class="btn btn-light btn-sm" href="index.php?action=result_detail&id='.(int)$r['id'].'">Question marks</a></td></tr>';}if(!$rows)echo '<tr><td colspan="7">No results found.</td></tr>';echo '</tbody></table></div></div>';
+    break;
+
+case 'result_detail':
+    require_role(['super_admin','exam_admin','student']);
+    $resultId=(int)($_GET['id']??0);$sql='SELECT r.*,e.title,e.exam_pattern,u.display_name FROM results r JOIN exams e ON e.id=r.exam_id JOIN users u ON u.id=r.student_user_id WHERE r.id=?';$params=[$resultId];if(current_user()['role']==='student'){$sql.=' AND r.student_user_id=? AND r.is_published=1';$params[]=(int)current_user()['id'];}
+    $s=$pdo->prepare($sql);$s->execute($params);$result=$s->fetch();if(!$result){http_response_code(404);echo '<div class="card">Result not found or not available.</div>';break;}
+    echo '<div class="card"><h2>'.e($result['title']).' · '.e($result['display_name']).'</h2><p><b>Total:</b> '.e($result['marks_obtained']).' / '.e($result['max_marks']).' · <b>Percentage:</b> '.number_format((float)$result['percentage'],2).'%</p></div>';
+    if(in_array($result['exam_pattern'],['mcq','mixed'],true)){$s=$pdo->prepare('SELECT q.question_text,q.marks,aa.marks_awarded,aa.is_correct FROM attempt_answers aa JOIN questions q ON q.id=aa.question_id WHERE aa.attempt_id=? ORDER BY q.id');$s->execute([$result['attempt_id']]);$mcqRows=$s->fetchAll();if($mcqRows){echo '<div class="card"><h2>Multiple-choice questions</h2><div class="table-wrap"><table><thead><tr><th>Question</th><th>Maximum marks</th><th>Awarded</th></tr></thead><tbody>';foreach($mcqRows as $row)echo '<tr><td>'.e($row['question_text']).'</td><td>'.e($row['marks']).'</td><td>'.e($row['marks_awarded']).'</td></tr>';echo '</tbody></table></div></div>';}}
+    if(in_array($result['exam_pattern'],['typing','mixed'],true)){$s=$pdo->prepare('SELECT dq.question_number,dq.question_text,dq.max_marks,da.answer_text,da.marks_awarded,da.marking_status,da.marking_explanation FROM descriptive_answers da JOIN descriptive_questions dq ON dq.id=da.descriptive_question_id WHERE da.attempt_id=? ORDER BY dq.question_number');$s->execute([$result['attempt_id']]);$writtenRows=$s->fetchAll();if($writtenRows){echo '<div class="card"><h2>Typing-answer questions</h2><div class="table-wrap"><table><thead><tr><th>Question</th><th>Your answer</th><th>Maximum marks</th><th>Awarded</th><th>Marking status</th></tr></thead><tbody>';foreach($writtenRows as $row)echo '<tr><td>'.e($row['question_text']).'</td><td>'.nl2br(e($row['answer_text'])).'</td><td>'.e($row['max_marks']).'</td><td>'.e($row['marks_awarded']).'</td><td>'.e(str_replace('_',' ',$row['marking_status'])).'</td></tr>';echo '</tbody></table></div></div>';}}
     break;
 
 case 'settings':
