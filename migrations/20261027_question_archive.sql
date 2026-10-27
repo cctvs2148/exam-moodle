@@ -1,0 +1,5 @@
+ALTER TABLE questions
+ ADD COLUMN is_archived TINYINT(1) NOT NULL DEFAULT 0;
+
+ALTER TABLE descriptive_questions
+ ADD COLUMN is_archived TINYINT(1) NOT NULL DEFAULT 0;

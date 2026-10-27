@@ -53,6 +53,9 @@ The app automatically checks for the question review flag column and applies thi
 3. Deploy the updated PHP/assets and reload the portal. New exams can be MCQ, Typing Answer, or Mixed. Existing exams remain MCQ.
 4. Restore only into a test database first if you need to verify the backup; never test a restore over the live database.
 
+### Existing database upgrade for question archiving
+The app automatically adds `is_archived` flags to the MCQ and typing question tables when the database account has ALTER permission. If the portal displays “Database update required,” run `migrations/20261027_question_archive.sql` once in phpMyAdmin, then reload the portal. The update preserves all questions, student answers, review history, and results.
+
 ## Student import
 - In Students, download the CSV template.
 - Open it in Excel and enter `register_number`, `student_name`, and optional `department`, `year_level`, `section`.
@@ -65,7 +68,8 @@ The app automatically checks for the question review flag column and applies thi
 2. Open **Typing questions** and add questions to the exam. Each question has a number, prompt, maximum marks, expected answer, optional accepted answers, optional numeric tolerance, and optional `phrase|marks` keyword rubric. Rubric weights must be positive and their sum cannot exceed the question maximum. Questions lock after the first attempt starts.
 3. Case, repeated whitespace, and (when enabled) punctuation are normalized for answer matching. Exact accepted answers receive full marks; numeric tolerance and explicitly weighted keyword rules are deterministic. Optional spelling tolerance is limited to a teacher-configured number of ASCII edits. Unsupported answers without a deterministic rubric are held for teacher review rather than assigned a guessed score.
 4. Students type answers in the timed exam page; answers autosave using the same secure attempt flow as MCQ answers. Answer keys are not loaded into student pages.
-5. Teachers open **Typing review**, verify pending or automatic scores, and save any override with a reason. Results are created only after every descriptive answer has a score; then an admin can publish through **Results & reports**. Published results include per-question marks.
+5. In **Question Bank**, choose a subject and optionally search through its paginated MCQs. In **Typing Questions**, choose an exam to manage its paginated written questions. Both pages can show archived questions. Archiving hides a question from future attempts while preserving existing answers and results; archiving/restoring is blocked while an affected exam has an in-progress attempt or is currently open.
+6. Teachers open **Typing review**, choose an exam date and exam, then search or page through students by register number. Open one student to review their answers question by question; **Save & next pending answer** advances through outstanding work, and **Close student review** returns to the student list. Completed reviews can be included when needed. Save any score override with a reason. Results are created only after every descriptive answer has a score; then an admin can publish through **Results & reports**. Published results include per-question marks.
 
 Run the focused deterministic marker tests with:
 `C:\xampp\php\php.exe tests\descriptive_marking_test.php`
